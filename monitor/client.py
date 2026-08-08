@@ -27,10 +27,16 @@ def create_client(settings: Settings) -> discord.Client:
                     settings.dm_cooldown_seconds,
                     settings.auto_dm_message,
                 )
+            if settings.paid_request_channel_id:
+                logger.info(
+                    "Paid-editor-request watcher enabled on channel %s for author '%s'",
+                    settings.paid_request_channel_id,
+                    settings.paid_request_trigger_author,
+                )
 
         async def on_message(self, message: discord.Message) -> None:
             if self.user is None:
                 return
-            await handle_incoming_message(message, settings, self.user.id)
+            await handle_incoming_message(message, settings, self.user.id, self)
 
     return MonitorClient()
