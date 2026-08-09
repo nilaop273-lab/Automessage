@@ -23,9 +23,10 @@ def create_client(settings: Settings) -> discord.Client:
             )
             if settings.auto_dm_enabled:
                 logger.info(
-                    "Auto-DM enabled (cooldown: %ds): %s",
+                    "Auto-DM enabled (cooldown: %ds, %d message variant(s), rotation: %s)",
                     settings.dm_cooldown_seconds,
-                    settings.auto_dm_message,
+                    len(settings.auto_dm_messages),
+                    settings.auto_dm_rotation,
                 )
             if settings.paid_request_channel_id:
                 logger.info(

@@ -6,6 +6,7 @@ import sys
 import discord
 
 from config import load_settings
+from monitor import storage
 from monitor.client import create_client
 
 logging.basicConfig(
@@ -21,6 +22,8 @@ def main() -> None:
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    storage.init_db()
 
     client = create_client(settings)
 

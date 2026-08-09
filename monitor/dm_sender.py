@@ -4,31 +4,23 @@ import asyncio
 import itertools
 import logging
 import random
-import time
 
 import discord
 
-logger = logging.getLogger(__name__)
+from monitor import storage
 
-_last_dm_at: dict[int, float] = {}
+logger = logging.getLogger(__name__)
 
 _rotation_cycle: itertools.cycle | None = None
 _rotation_pool_id: int | None = None
 
 
 def is_on_cooldown(user_id: int, cooldown_seconds: int) -> bool:
-    if cooldown_seconds == 0:
-        return False
-
-    last_sent = _last_dm_at.get(user_id)
-    if last_sent is None:
-        return False
-
-    return (time.monotonic() - last_sent) < cooldown_seconds
+    return storage.is_user_on_cooldown(user_id, cooldown_seconds)
 
 
 def record_dm(user_id: int) -> None:
-    _last_dm_at[user_id] = time.monotonic()
+    storage.record_user_dm(user_id)
 
 
 def pick_message(messages: list[str], mode: str = "random") -> str:
@@ -44,7 +36,6 @@ def pick_message(messages: list[str], mode: str = "random") -> str:
     if mode == "random":
         return random.choice(messages)
 
-    # sequential / round-robin — rebuild the cycle if the pool identity changed
     pool_id = id(messages)
     if _rotation_cycle is None or _rotation_pool_id != pool_id:
         _rotation_cycle = itertools.cycle(messages)

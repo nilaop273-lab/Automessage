@@ -7,14 +7,11 @@ from datetime import timezone
 import discord
 
 from config import Settings
-from monitor import dm_sender
+from monitor import dm_sender, storage
 
 logger = logging.getLogger(__name__)
 
 REQUEST_PATTERN = re.compile(r"request by:\s*<@!?(\d+)>", re.IGNORECASE)
-
-# Dedupe store for the paid-editor-request flow specifically
-_processed_paid_requests: set[int] = set()
 
 
 async def resolve_message_content(message: discord.Message) -> str:
@@ -30,6 +27,26 @@ async def resolve_message_content(message: discord.Message) -> str:
         logger.warning("Could not fetch message %s from history: %s", message.id, exc)
 
     return ""
+
+
+def extract_embed_text(message: discord.Message) -> str:
+    """Pull all readable text out of a message's embeds (title, description, fields, footer)."""
+    parts: list[str] = []
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(str(embed.title))
+        if embed.description:
+            parts.append(str(embed.description))
+        for field in embed.fields:
+            if field.name:
+                parts.append(str(field.name))
+            if field.value:
+                parts.append(str(field.value))
+        if embed.footer and embed.footer.text:
+            parts.append(str(embed.footer.text))
+        if embed.author and embed.author.name:
+            parts.append(str(embed.author.name))
+    return "\n".join(parts)
 
 
 def passes_keyword_filter(content: str, keywords: list[str]) -> bool:
@@ -84,8 +101,8 @@ async def handle_paid_editor_request(
     settings: Settings,
     client: discord.Client,
 ) -> None:
-    """Watches a specific channel/author for 'paid editor request by: <@id>'
-    posts and DMs the requester, one line at a time as separate messages."""
+    """Watches a specific channel/author for 'request by: <@id>' posts and
+    DMs the requester, one line at a time as separate messages."""
     if settings.paid_request_channel_id is None:
         return
     if message.channel.id != settings.paid_request_channel_id:
@@ -95,10 +112,10 @@ async def handle_paid_editor_request(
 
     logger.info(f"Received message from {message.author} in target channel {message.channel.id}")
 
-    if message.id in _processed_paid_requests:
+    if storage.is_message_processed(message.id, kind="paid_request"):
         logger.info(f"Message {message.id} already processed, skipping")
         return
-    _processed_paid_requests.add(message.id)
+    storage.mark_message_processed(message.id, kind="paid_request")
 
     content = await resolve_message_content(message)
     logger.info(f"Message content: {content}")
@@ -110,6 +127,13 @@ async def handle_paid_editor_request(
 
     user_id = int(match.group(1))
     logger.info(f"Found requester with ID: {user_id}")
+
+    embed_text = extract_embed_text(message)
+    combined_text = f"{content}\n{embed_text}"
+
+    if not passes_keyword_filter(combined_text, settings.keyword_filter):
+        logger.info(f"Request from {user_id} skipped — no matching keywords in embed/content")
+        return
 
     if dm_sender.is_on_cooldown(user_id, settings.dm_cooldown_seconds):
         logger.info(f"DM rate limit exceeded for user {user_id}")
@@ -165,6 +189,11 @@ async def handle_incoming_message(
     if message.author.id == self_user_id:
         return
 
+    if storage.is_message_processed(message.id, kind="auto_dm"):
+        logger.info(f"Message {message.id} already processed for auto-DM, skipping")
+        return
+    storage.mark_message_processed(message.id, kind="auto_dm")
+
     content = await resolve_message_content(message)
 
     if not passes_keyword_filter(content, settings.keyword_filter):
@@ -183,11 +212,17 @@ async def handle_incoming_message(
         logger.info("DM skipped for %s (%s) — cooldown active", author, author.id)
         return
 
-    if await dm_sender.send_auto_dm(
+    dm_text = dm_sender.pick_message(settings.auto_dm_messages, settings.auto_dm_rotation)
+
+    if await dm_sender.send_auto_dm_sequence(
         author,
-        settings.auto_dm_message,
+        dm_text,
         settings.dm_delay_min_seconds,
         settings.dm_delay_max_seconds,
+        settings.dm_part_delay_min_seconds,
+        settings.dm_part_delay_max_seconds,
     ):
         dm_sender.record_dm(author.id)
-        logger.info("DM sent to %s (%s)", author, author.id)
+        logger.info("DM sequence sent to %s (%s)", author, author.id)
+    else:
+        logger.info("DM sequence not fully sent to %s (%s)", author, author.id)
