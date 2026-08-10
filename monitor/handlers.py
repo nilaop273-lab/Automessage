@@ -13,6 +13,17 @@ logger = logging.getLogger(__name__)
 
 REQUEST_PATTERN = re.compile(r"request by:\s*<@!?(\d+)>", re.IGNORECASE)
 
+# Discord markdown emphasis markers that can land right next to the target
+# text (e.g. "**paid editor request by:** <@id>") and break whitespace-only
+# gaps in regexes like REQUEST_PATTERN. Stripped before matching.
+_MARKDOWN_EMPHASIS = re.compile(r"\*{1,3}|_{1,3}|~~")
+
+
+def strip_markdown_emphasis(text: str) -> str:
+    """Remove bold/italic/strikethrough markers so regex matching isn't
+    thrown off by formatting placed around the target text."""
+    return _MARKDOWN_EMPHASIS.sub("", text)
+
 
 async def resolve_message_content(message: discord.Message) -> str:
     """Self-bot events sometimes omit content; history fetch is the workaround."""
@@ -120,20 +131,23 @@ async def handle_paid_editor_request(
     content = await resolve_message_content(message)
     logger.info(f"Message content: {content}")
 
-    match = REQUEST_PATTERN.search(content)
+    # Build embed text and the combined search text BEFORE the regex check,
+    # so a "request by:" line that only lives inside an embed isn't missed.
+    embed_text = extract_embed_text(message)
+    combined_text = f"{content}\n{embed_text}"
+
+    # Strip markdown emphasis (bold/italic/strikethrough) so formatting like
+    # "**paid editor request by:** <@id>" doesn't break the whitespace-only
+    # gap the regex expects between "by:" and the mention.
+    search_text = strip_markdown_emphasis(combined_text)
+
+    match = REQUEST_PATTERN.search(search_text)
     if not match:
-        logger.info("Regex pattern did not match message content")
+        logger.info("Regex pattern did not match message content or embeds")
         return
 
     user_id = int(match.group(1))
     logger.info(f"Found requester with ID: {user_id}")
-
-    embed_text = extract_embed_text(message)
-    combined_text = f"{content}\n{embed_text}"
-
-    if not passes_keyword_filter(combined_text, settings.keyword_filter):
-        logger.info(f"Request from {user_id} skipped — no matching keywords in embed/content")
-        return
 
     if dm_sender.is_on_cooldown(user_id, settings.dm_cooldown_seconds):
         logger.info(f"DM rate limit exceeded for user {user_id}")
