@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+# *storage.py — SQLite layer*
+# Existing tables: processed_messages, dm_cooldowns  (unchanged)
+# New table:       dm_queue  — crash-safe resume state for captcha pauses
+#
+# dm_queue schema:
+#   queue_id    — autoincrement PK
+#   user_id     — who we're DMing
+#   username    — display name for Telegram alerts
+#   part_index  — which part (0-based) we're currently on
+#   total_parts — total number of parts in the message
+#   parts_json  — JSON array of all message parts (full list, not just remaining)
+#   status      — 'pending' | 'paused' | 'done'
+#   created_at  — unix timestamp
+
+import json
 import sqlite3
 import threading
 import time
@@ -41,8 +56,25 @@ def init_db() -> None:
             )
             """
         )
+        # ── new: captcha-safe queue ────────────────────────────────────────
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_queue (
+                queue_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                username    TEXT    NOT NULL,
+                part_index  INTEGER NOT NULL DEFAULT 0,
+                total_parts INTEGER NOT NULL,
+                parts_json  TEXT    NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                created_at  REAL    NOT NULL
+            )
+            """
+        )
         conn.commit()
 
+
+# ── existing helpers (unchanged) ───────────────────────────────────────────
 
 def is_message_processed(message_id: int, kind: str) -> bool:
     conn = _get_connection()
@@ -97,10 +129,75 @@ def record_user_dm(user_id: int) -> None:
 
 
 def cleanup_old_processed_messages(older_than_seconds: int = 30 * 24 * 3600) -> None:
-    """Optional housekeeping: purge processed-message records older than N seconds
-    (default 30 days) so the DB doesn't grow forever."""
+    """Purge processed-message records older than N seconds (default 30 days)."""
     conn = _get_connection()
     cutoff = time.time() - older_than_seconds
     with _lock:
         conn.execute("DELETE FROM processed_messages WHERE processed_at < ?", (cutoff,))
+        conn.commit()
+
+
+# ── new: dm_queue helpers ──────────────────────────────────────────────────
+
+def queue_create(user_id: int, username: str, parts: list[str]) -> int:
+    """
+    Insert a new dm_queue row before we start sending.
+    Returns the queue_id so dm_sender can update it as it progresses.
+    """
+    conn = _get_connection()
+    with _lock:
+        cur = conn.execute(
+            """
+            INSERT INTO dm_queue (user_id, username, part_index, total_parts, parts_json, status, created_at)
+            VALUES (?, ?, 0, ?, ?, 'pending', ?)
+            """,
+            (user_id, username, len(parts), json.dumps(parts), time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def queue_update_progress(queue_id: int, part_index: int, status: str) -> None:
+    """Advance part_index and/or flip status ('pending' | 'paused' | 'done')."""
+    conn = _get_connection()
+    with _lock:
+        conn.execute(
+            "UPDATE dm_queue SET part_index = ?, status = ? WHERE queue_id = ?",
+            (part_index, status, queue_id),
+        )
+        conn.commit()
+
+
+def queue_get(queue_id: int) -> dict | None:
+    """Fetch a single dm_queue row as a dict. Returns None if not found."""
+    conn = _get_connection()
+    with _lock:
+        cur = conn.execute(
+            "SELECT queue_id, user_id, username, part_index, total_parts, parts_json, status "
+            "FROM dm_queue WHERE queue_id = ?",
+            (queue_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "queue_id":    row[0],
+        "user_id":     row[1],
+        "username":    row[2],
+        "part_index":  row[3],
+        "total_parts": row[4],
+        "parts":       json.loads(row[5]),
+        "status":      row[6],
+    }
+
+
+def queue_cleanup_done(older_than_seconds: int = 7 * 24 * 3600) -> None:
+    """Prune 'done' rows older than N seconds (default 7 days)."""
+    conn = _get_connection()
+    cutoff = time.time() - older_than_seconds
+    with _lock:
+        conn.execute(
+            "DELETE FROM dm_queue WHERE status = 'done' AND created_at < ?",
+            (cutoff,),
+        )
         conn.commit()

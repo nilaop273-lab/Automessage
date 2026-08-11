@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 
@@ -28,7 +30,6 @@ def _parse_message_pool(raw: str | None) -> list[str]:
     if not raw or not raw.strip():
         return []
     messages = [m.strip() for m in raw.split("|||") if m.strip()]
-    # Convert literal \n from .env into real newlines
     return [m.replace("\\n", "\n") for m in messages]
 
 
@@ -53,6 +54,9 @@ class Settings:
     paid_request_dm_rotation: str
     paid_request_part_delay_min_seconds: float
     paid_request_part_delay_max_seconds: float
+    # --- telegram captcha notifier (NEW) ---
+    tg_bot_token: str
+    tg_chat_id: int
 
 
 def load_settings() -> Settings:
@@ -73,7 +77,6 @@ def load_settings() -> Settings:
 
     auto_dm_messages = _parse_message_pool(os.getenv("AUTO_DM_MESSAGES"))
     if not auto_dm_messages:
-        # Backward compatibility with the old singular AUTO_DM_MESSAGE
         legacy = os.getenv("AUTO_DM_MESSAGE", "").strip()
         if legacy:
             auto_dm_messages = [legacy.replace("\\n", "\n")]
@@ -145,6 +148,20 @@ def load_settings() -> Settings:
             "when PAID_REQUEST_CHANNEL_ID is set."
         )
 
+    # ── Telegram (NEW) ─────────────────────────────────────────────────────
+    tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
+    if not tg_bot_token:
+        raise ValueError(
+            "Set TG_BOT_TOKEN in .env — get one from @BotFather on Telegram."
+        )
+
+    raw_tg_chat = os.getenv("TG_CHAT_ID", "").strip()
+    if not raw_tg_chat:
+        raise ValueError(
+            "Set TG_CHAT_ID in .env — your personal Telegram user ID (use @userinfobot to find it)."
+        )
+    tg_chat_id = int(raw_tg_chat)
+
     return Settings(
         token=token,
         monitored_channel_ids=channel_ids,
@@ -164,4 +181,6 @@ def load_settings() -> Settings:
         paid_request_dm_rotation=paid_request_dm_rotation,
         paid_request_part_delay_min_seconds=paid_request_part_delay_min_seconds,
         paid_request_part_delay_max_seconds=paid_request_part_delay_max_seconds,
+        tg_bot_token=tg_bot_token,
+        tg_chat_id=tg_chat_id,
     )

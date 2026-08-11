@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+# *dm_sender.py — DM delivery engine with captcha-safe pause/resume*
+#
+# Flow for send_auto_dm_sequence:
+#   1. Split message into parts, persist the full list to dm_queue (crash-safe)
+#   2. For each part:
+#       a. Check the pause gate — block here if we're already paused
+#       b. Send the part
+#       c. On success  → advance queue row, inter-part delay, next part
+#       d. On captcha  → exponential backoff x2 (30 s, 90 s)
+#                        if both retries fail:
+#                          → pause the gate
+#                          → notify Telegram
+#                          → await gate.wait() (blocks until /resume)
+#                          → retry the same part once more, then continue
+#       e. On other HTTP error or Forbidden → log and return False immediately
+#   3. On full success → mark queue 'done', return True
+
 import asyncio
 import itertools
 import logging
@@ -8,12 +25,22 @@ import random
 import discord
 
 from monitor import storage
+from tg import telegram_bot
+from tg.state import gate, PauseContext
 
 logger = logging.getLogger(__name__)
 
+# ── rotation state (module-level, same as original) ───────────────────────
 _rotation_cycle: itertools.cycle | None = None
 _rotation_pool_id: int | None = None
 
+# ── backoff schedule for captcha retries ──────────────────────────────────
+# Two automatic retries before escalating to Telegram + manual resume.
+# Delays are in seconds: first retry after 30 s, second after 90 s.
+_CAPTCHA_BACKOFF_DELAYS: tuple[float, ...] = (30.0, 90.0)
+
+
+# ── helpers (unchanged API) ───────────────────────────────────────────────
 
 def is_on_cooldown(user_id: int, cooldown_seconds: int) -> bool:
     return storage.is_user_on_cooldown(user_id, cooldown_seconds)
@@ -24,7 +51,7 @@ def record_dm(user_id: int) -> None:
 
 
 def pick_message(messages: list[str], mode: str = "random") -> str:
-    """Pick a message from the pool. mode: 'random' or 'sequential' (round-robin)."""
+    """Pick a message from the pool. mode: 'random' or 'sequential'."""
     global _rotation_cycle, _rotation_pool_id
 
     if not messages:
@@ -43,6 +70,27 @@ def pick_message(messages: list[str], mode: str = "random") -> str:
     return next(_rotation_cycle)
 
 
+# ── captcha fingerprinting ────────────────────────────────────────────────
+
+def _is_captcha_error(exc: discord.HTTPException) -> bool:
+    """
+    Identify captcha errors from Discord's HTTP response.
+
+    From your log:
+        400 Bad Request (error code: -1): Captcha required
+    Discord also sends JSON with "captcha_key" in the body for some flows.
+    We catch both.
+    """
+    err_text = str(exc).lower()
+    return (
+        "captcha" in err_text
+        or getattr(exc, "code", None) == -1
+        or exc.status == 400 and "captcha" in err_text
+    )
+
+
+# ── single-message send (unchanged public API) ────────────────────────────
+
 async def send_auto_dm(
     author: discord.User | discord.Member,
     message: str,
@@ -60,8 +108,7 @@ async def send_auto_dm(
     except discord.Forbidden:
         logger.warning(
             "DM failed for %s (%s) — DMs closed or blocked",
-            author,
-            author.id,
+            author, author.id,
         )
         return False
     except discord.HTTPException as exc:
@@ -71,6 +118,8 @@ async def send_auto_dm(
     return True
 
 
+# ── core: captcha-aware sequence sender ──────────────────────────────────
+
 async def send_auto_dm_sequence(
     author: discord.User | discord.Member,
     message: str,
@@ -79,47 +128,203 @@ async def send_auto_dm_sequence(
     part_delay_min: float,
     part_delay_max: float,
 ) -> bool:
-    """Split `message` on newlines and send each line as its own DM,
-    with an initial delay before the first message and a randomized
-    cooldown between each subsequent part.
+    """
+    Split `message` on newlines, send each line as its own DM.
+
+    Captcha behaviour:
+      • Two automatic retries with 30 s / 90 s backoff.
+      • If both fail: pause gate, Telegram alert, await /resume, one final retry.
+      • All progress is persisted to dm_queue so a process crash doesn't lose position.
 
     Returns True only if every part was sent successfully.
     """
     parts = [line.strip() for line in message.split("\n") if line.strip()]
     if not parts:
-        logger.warning("send_auto_dm_sequence called with an empty message for %s", author.id)
+        logger.warning(
+            "send_auto_dm_sequence called with empty message for %s", author.id
+        )
         return False
 
+    total = len(parts)
+    username = str(author)
+
+    # ── 1. persist queue row before touching Discord ───────────────────────
+    queue_id = storage.queue_create(author.id, username, parts)
+    logger.info(
+        "dm_queue row %d created for %s (%d part(s))", queue_id, username, total
+    )
+
+    # ── 2. initial delay ───────────────────────────────────────────────────
     delay = random.uniform(delay_min, delay_max)
     if delay > 0:
-        logger.info("Waiting %.1fs before DM sequence to %s (%s)", delay, author, author.id)
+        logger.info(
+            "Waiting %.1fs before DM sequence to %s (%s)", delay, author, author.id
+        )
         await asyncio.sleep(delay)
 
-    for index, part in enumerate(parts, start=1):
-        try:
-            await author.send(part)
+    # ── 3. iterate over parts ─────────────────────────────────────────────
+    index = 0
+    while index < total:
+        part = parts[index]
+        human_index = index + 1      # 1-based for logging
+
+        # ── 3a. honour any active pause before attempting a send ───────────
+        if gate.is_paused:
             logger.info(
-                "Sent DM part %d/%d to %s (%s)", index, len(parts), author, author.id
+                "Gate is paused before part %d/%d for %s — waiting for /resume",
+                human_index, total, username,
             )
-        except discord.Forbidden:
-            logger.warning(
-                "DM sequence failed for %s (%s) at part %d/%d — DMs closed or blocked",
-                author, author.id, index, len(parts),
-            )
-            return False
-        except discord.HTTPException as exc:
-            logger.error(
-                "DM sequence failed for %s (%s) at part %d/%d: %s",
-                author, author.id, index, len(parts), exc,
-            )
+            await gate.wait()
+            logger.info("Gate opened — continuing DM to %s", username)
+
+        # ── 3b. attempt send with captcha-aware retry loop ─────────────────
+        sent = await _send_part_with_captcha_retry(
+            author=author,
+            part=part,
+            part_human_index=human_index,
+            total=total,
+            queue_id=queue_id,
+            index=index,
+            username=username,
+        )
+
+        if sent is False:
+            # Non-captcha fatal error (Forbidden, other HTTP) — abort sequence.
+            storage.queue_update_progress(queue_id, index, "paused")
             return False
 
-        if index < len(parts):
+        # ── 3c. part sent — advance queue ──────────────────────────────────
+        index += 1
+        storage.queue_update_progress(queue_id, index, "pending")
+
+        # ── 3d. inter-part delay (skip after the last part) ───────────────
+        if index < total:
             gap = random.uniform(part_delay_min, part_delay_max)
             if gap > 0:
                 logger.info(
-                    "Waiting %.1fs before next DM part to %s (%s)", gap, author, author.id
+                    "Waiting %.1fs before next part to %s (%s)", gap, author, author.id
                 )
                 await asyncio.sleep(gap)
 
+    # ── 4. all parts done ─────────────────────────────────────────────────
+    storage.queue_update_progress(queue_id, total, "done")
+    logger.info(
+        "DM sequence complete for %s (%s) — %d part(s) sent", author, author.id, total
+    )
     return True
+
+
+# ── internal: one part, full captcha retry logic ──────────────────────────
+
+async def _send_part_with_captcha_retry(
+    author: discord.User | discord.Member,
+    part: str,
+    part_human_index: int,
+    total: int,
+    queue_id: int,
+    index: int,
+    username: str,
+) -> bool | None:
+    """
+    Try to send one part. Returns:
+        True   — sent successfully
+        False  — fatal non-captcha error, caller should abort
+        None   — should never happen (all paths covered)
+
+    Captcha path:
+        attempt 0 (original)
+            → captcha → wait 30 s → attempt 1
+            → captcha → wait 90 s → attempt 2
+            → captcha → pause gate + Telegram + await /resume → attempt 3
+            → captcha on attempt 3 → return False (give up)
+        Any attempt succeeds → return True
+        Non-captcha HTTP error on any attempt → return False immediately
+    """
+    max_auto_retries = len(_CAPTCHA_BACKOFF_DELAYS)   # 2
+
+    for attempt in range(max_auto_retries + 2):        # 0,1,2 = auto; 3 = post-resume
+        try:
+            await author.send(part)
+            logger.info(
+                "Sent DM part %d/%d to %s (%s) on attempt %d",
+                part_human_index, total, author, author.id, attempt,
+            )
+            return True
+
+        except discord.Forbidden:
+            logger.warning(
+                "DM part %d/%d forbidden for %s (%s) — DMs closed or blocked",
+                part_human_index, total, author, author.id,
+            )
+            return False   # fatal — don't retry
+
+        except discord.HTTPException as exc:
+            error_str = str(exc)
+
+            if not _is_captcha_error(exc):
+                # Not a captcha — some other HTTP error, bail immediately.
+                logger.error(
+                    "DM part %d/%d failed for %s (%s): %s",
+                    part_human_index, total, author, author.id, exc,
+                )
+                return False
+
+            # ── captcha hit ────────────────────────────────────────────────
+            logger.warning(
+                "Captcha on part %d/%d for %s (%s) attempt %d: %s",
+                part_human_index, total, author, author.id, attempt, exc,
+            )
+
+            if attempt < max_auto_retries:
+                # Auto-backoff retry (attempts 0 and 1).
+                backoff = _CAPTCHA_BACKOFF_DELAYS[attempt]
+                logger.info(
+                    "Backoff retry %d/%d in %.0fs for %s",
+                    attempt + 1, max_auto_retries, backoff, username,
+                )
+                await asyncio.sleep(backoff)
+                continue   # retry the send
+
+            if attempt == max_auto_retries:
+                # Auto retries exhausted — escalate to Telegram + manual resume.
+                ctx = PauseContext(
+                    user_id=author.id,
+                    username=username,
+                    part_index=index,
+                    total_parts=total,
+                    last_error=error_str,
+                )
+                gate.pause(ctx)
+                storage.queue_update_progress(queue_id, index, "paused")
+
+                logger.warning(
+                    "Captcha persisted after %d auto-retries for %s — "
+                    "pausing and sending Telegram alert",
+                    max_auto_retries, username,
+                )
+
+                # Send Telegram notification (non-blocking on failure).
+                await telegram_bot.notify_captcha(
+                    username=username,
+                    user_id=author.id,
+                    part=part_human_index,
+                    total=total,
+                    error=error_str,
+                )
+
+                # Block here until you send /resume from Telegram.
+                logger.info("Awaiting /resume from Telegram for %s", username)
+                await gate.wait()
+                logger.info("Resumed — retrying part %d/%d for %s", part_human_index, total, username)
+
+                storage.queue_update_progress(queue_id, index, "pending")
+                continue   # attempt 3: one final try after manual resume
+
+            # attempt == max_auto_retries + 1 (post-resume attempt also captcha'd)
+            logger.error(
+                "Captcha still firing after manual resume for %s (%s) — aborting part %d/%d",
+                author, author.id, part_human_index, total,
+            )
+            return False
+
+    return False   # unreachable but satisfies type checker
