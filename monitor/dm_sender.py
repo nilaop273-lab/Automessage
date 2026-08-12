@@ -8,12 +8,8 @@ from __future__ import annotations
 #       a. Check the pause gate — block here if we're already paused
 #       b. Send the part
 #       c. On success  → advance queue row, inter-part delay, next part
-#       d. On captcha  → exponential backoff x2 (30 s, 90 s)
-#                        if both retries fail:
-#                          → pause the gate
-#                          → notify Telegram
-#                          → await gate.wait() (blocks until /resume)
-#                          → retry the same part once more, then continue
+#       d. On captcha  → immediately pause gate + notify Telegram + await /resume
+#                        → retry the same part once after resume
 #       e. On other HTTP error or Forbidden → log and return False immediately
 #   3. On full success → mark queue 'done', return True
 
@@ -33,11 +29,6 @@ logger = logging.getLogger(__name__)
 # ── rotation state (module-level, same as original) ───────────────────────
 _rotation_cycle: itertools.cycle | None = None
 _rotation_pool_id: int | None = None
-
-# ── backoff schedule for captcha retries ──────────────────────────────────
-# Two automatic retries before escalating to Telegram + manual resume.
-# Delays are in seconds: first retry after 30 s, second after 90 s.
-_CAPTCHA_BACKOFF_DELAYS: tuple[float, ...] = (30.0, 90.0)
 
 
 # ── helpers (unchanged API) ───────────────────────────────────────────────
@@ -132,9 +123,10 @@ async def send_auto_dm_sequence(
     Split `message` on newlines, send each line as its own DM.
 
     Captcha behaviour:
-      • Two automatic retries with 30 s / 90 s backoff.
-      • If both fail: pause gate, Telegram alert, await /resume, one final retry.
-      • All progress is persisted to dm_queue so a process crash doesn't lose position.
+      • Captcha hit → immediately pause gate + Telegram alert + await /resume.
+      • After /resume → one final retry on the same part.
+      • If that also fails → abort sequence.
+      • All progress persisted to dm_queue so a process crash doesn't lose position.
 
     Returns True only if every part was sent successfully.
     """
@@ -177,8 +169,8 @@ async def send_auto_dm_sequence(
             await gate.wait()
             logger.info("Gate opened — continuing DM to %s", username)
 
-        # ── 3b. attempt send with captcha-aware retry loop ─────────────────
-        sent = await _send_part_with_captcha_retry(
+        # ── 3b. attempt send ───────────────────────────────────────────────
+        sent = await _send_part(
             author=author,
             part=part,
             part_human_index=human_index,
@@ -189,7 +181,6 @@ async def send_auto_dm_sequence(
         )
 
         if sent is False:
-            # Non-captcha fatal error (Forbidden, other HTTP) — abort sequence.
             storage.queue_update_progress(queue_id, index, "paused")
             return False
 
@@ -214,9 +205,9 @@ async def send_auto_dm_sequence(
     return True
 
 
-# ── internal: one part, full captcha retry logic ──────────────────────────
+# ── internal: one part, immediate captcha escalation ─────────────────────
 
-async def _send_part_with_captcha_retry(
+async def _send_part(
     author: discord.User | discord.Member,
     part: str,
     part_human_index: int,
@@ -224,30 +215,24 @@ async def _send_part_with_captcha_retry(
     queue_id: int,
     index: int,
     username: str,
-) -> bool | None:
+) -> bool:
     """
     Try to send one part. Returns:
-        True   — sent successfully
-        False  — fatal non-captcha error, caller should abort
-        None   — should never happen (all paths covered)
+        True  — sent successfully
+        False — fatal error, caller should abort
 
-    Captcha path:
-        attempt 0 (original)
-            → captcha → wait 30 s → attempt 1
-            → captcha → wait 90 s → attempt 2
-            → captcha → pause gate + Telegram + await /resume → attempt 3
-            → captcha on attempt 3 → return False (give up)
-        Any attempt succeeds → return True
-        Non-captcha HTTP error on any attempt → return False immediately
+    Captcha path (no backoff):
+        attempt 0 → captcha → pause gate + Telegram alert + await /resume
+        attempt 1 (post-resume) → success → True
+                                → captcha again → False (give up)
+        Non-captcha / Forbidden → False immediately
     """
-    max_auto_retries = len(_CAPTCHA_BACKOFF_DELAYS)   # 2
-
-    for attempt in range(max_auto_retries + 2):        # 0,1,2 = auto; 3 = post-resume
+    for attempt in range(2):    # 0 = first try, 1 = post-resume retry
         try:
             await author.send(part)
             logger.info(
-                "Sent DM part %d/%d to %s (%s) on attempt %d",
-                part_human_index, total, author, author.id, attempt,
+                "Sent DM part %d/%d to %s (%s)",
+                part_human_index, total, author, author.id,
             )
             return True
 
@@ -256,13 +241,12 @@ async def _send_part_with_captcha_retry(
                 "DM part %d/%d forbidden for %s (%s) — DMs closed or blocked",
                 part_human_index, total, author, author.id,
             )
-            return False   # fatal — don't retry
+            return False
 
         except discord.HTTPException as exc:
             error_str = str(exc)
 
             if not _is_captcha_error(exc):
-                # Not a captcha — some other HTTP error, bail immediately.
                 logger.error(
                     "DM part %d/%d failed for %s (%s): %s",
                     part_human_index, total, author, author.id, exc,
@@ -271,22 +255,12 @@ async def _send_part_with_captcha_retry(
 
             # ── captcha hit ────────────────────────────────────────────────
             logger.warning(
-                "Captcha on part %d/%d for %s (%s) attempt %d: %s",
-                part_human_index, total, author, author.id, attempt, exc,
+                "Captcha on part %d/%d for %s (%s): %s",
+                part_human_index, total, author, author.id, exc,
             )
 
-            if attempt < max_auto_retries:
-                # Auto-backoff retry (attempts 0 and 1).
-                backoff = _CAPTCHA_BACKOFF_DELAYS[attempt]
-                logger.info(
-                    "Backoff retry %d/%d in %.0fs for %s",
-                    attempt + 1, max_auto_retries, backoff, username,
-                )
-                await asyncio.sleep(backoff)
-                continue   # retry the send
-
-            if attempt == max_auto_retries:
-                # Auto retries exhausted — escalate to Telegram + manual resume.
+            if attempt == 0:
+                # First hit — pause immediately, alert Telegram, wait for /resume
                 ctx = PauseContext(
                     user_id=author.id,
                     username=username,
@@ -297,13 +271,6 @@ async def _send_part_with_captcha_retry(
                 gate.pause(ctx)
                 storage.queue_update_progress(queue_id, index, "paused")
 
-                logger.warning(
-                    "Captcha persisted after %d auto-retries for %s — "
-                    "pausing and sending Telegram alert",
-                    max_auto_retries, username,
-                )
-
-                # Send Telegram notification (non-blocking on failure).
                 await telegram_bot.notify_captcha(
                     username=username,
                     user_id=author.id,
@@ -312,19 +279,20 @@ async def _send_part_with_captcha_retry(
                     error=error_str,
                 )
 
-                # Block here until you send /resume from Telegram.
                 logger.info("Awaiting /resume from Telegram for %s", username)
                 await gate.wait()
-                logger.info("Resumed — retrying part %d/%d for %s", part_human_index, total, username)
-
+                logger.info(
+                    "Resumed — retrying part %d/%d for %s",
+                    part_human_index, total, username,
+                )
                 storage.queue_update_progress(queue_id, index, "pending")
-                continue   # attempt 3: one final try after manual resume
+                continue    # attempt 1: retry after manual resume
 
-            # attempt == max_auto_retries + 1 (post-resume attempt also captcha'd)
+            # attempt == 1: captcha still firing after manual resume → give up
             logger.error(
                 "Captcha still firing after manual resume for %s (%s) — aborting part %d/%d",
                 author, author.id, part_human_index, total,
             )
             return False
 
-    return False   # unreachable but satisfies type checker
+    return False    # unreachable but satisfies type checker
