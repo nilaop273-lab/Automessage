@@ -279,8 +279,9 @@ async def _cmd_help(session: aiohttp.ClientSession) -> None:
             "/status    bot process state + uptime\n"
             "\n"
             "⚠️  CAPTCHA\n"
-            "/resume    unblock next stuck DM\n"
-            "/queue     show full captcha queue\n"
+            "/resume      unblock next stuck DM\n"
+            "/skip <n>    cancel DM at queue position n\n"
+            "/queue       show full captcha queue\n"
             "\n"
             "📋  LOGS\n"
             "/logs on   enable log forwarding to Telegram\n"
@@ -333,6 +334,36 @@ async def _cmd_resume(session: aiohttp.ClientSession) -> None:
         return
     _write_signal("resume")
     await _send(session, "⏳ Resume signal sent to bot — check logs for confirmation")
+
+
+async def _cmd_skip(session: aiohttp.ClientSession, text: str) -> None:
+    if not _is_running():
+        await _send(session, "⚠️ Bot is not running — queue is empty")
+        return
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        # No position — ask bot for queue so user can decide
+        _write_signal("queue_status")
+        await _send(
+            session,
+            "Usage: /skip <number>\nExample: /skip 1\n\nSending queue so you can see positions…",
+        )
+        return
+
+    try:
+        position = int(parts[1])
+    except ValueError:
+        await _send(session, f"❌ Invalid position: '{parts[1]}'\nUsage: /skip 1")
+        return
+
+    if position < 1:
+        await _send(session, "❌ Position must be 1 or higher.")
+        return
+
+    # Signal file name encodes the position: "skip:1", "skip:2" etc
+    _write_signal(f"skip:{position}")
+    await _send(session, f"🗑 Skip signal sent for position {position} — bot will confirm shortly")
 
 
 async def _cmd_queue(session: aiohttp.ClientSession) -> None:
@@ -414,6 +445,8 @@ async def run() -> None:
                     await _cmd_status(session)
                 elif text.startswith("/resume"):
                     await _cmd_resume(session)
+                elif text.startswith("/skip"):
+                    await _cmd_skip(session, text)
                 elif text.startswith("/queue"):
                     await _cmd_queue(session)
                 elif text.startswith("/logs"):

@@ -55,6 +55,7 @@ async def _signal_poller(tg_token: str, tg_chat_id: int) -> None:
 
     Signals handled:
         resume        → captcha_queue.resume_next()
+        skip:<n>      → captcha_queue.skip(n)
         queue_status  → send captcha queue snapshot to Telegram
         logs_on       → unmute TelegramLogHandler
         logs_off      → mute TelegramLogHandler
@@ -80,6 +81,9 @@ async def _signal_poller(tg_token: str, tg_chat_id: int) -> None:
 
                 if name == "resume":
                     await _handle_signal_resume(session, tg_token, tg_chat_id, captcha_queue)
+
+                elif name.startswith("skip:"):
+                    await _handle_signal_skip(session, tg_token, tg_chat_id, captcha_queue, name)
 
                 elif name == "queue_status":
                     await _handle_signal_queue(session, tg_token, tg_chat_id, captcha_queue)
@@ -185,6 +189,64 @@ async def _handle_signal_queue(session, tg_token, tg_chat_id, captcha_queue) -> 
         )
     lines.append("\nSend /resume to unblock the next one in queue.")
     await telegram_bot.send_message(session, tg_token, tg_chat_id, "\n".join(lines))
+
+
+async def _handle_signal_skip(
+    session, tg_token, tg_chat_id, captcha_queue, signal_name: str
+) -> None:
+    import time as _time
+
+    # signal name format: "skip:1", "skip:2" etc
+    try:
+        position = int(signal_name.split(":")[1])
+    except (IndexError, ValueError):
+        await telegram_bot.send_message(
+            session, tg_token, tg_chat_id,
+            "❌ Invalid skip signal — expected format skip:<number>",
+        )
+        return
+
+    if not captcha_queue.is_paused:
+        await telegram_bot.send_message(
+            session, tg_token, tg_chat_id,
+            "✅ Queue is empty — nothing to skip.",
+        )
+        return
+
+    skipped = captcha_queue.skip(position)
+
+    if skipped is None:
+        total = captcha_queue.pending
+        await telegram_bot.send_message(
+            session, tg_token, tg_chat_id,
+            f"❌ Position {position} out of range — queue has {total} entry(s).\n"
+            f"Send /queue to see current positions.",
+        )
+        return
+
+    remaining = captcha_queue.pending
+    logger.info(
+        "Skipped position %d → %s (id: %s) — %d remaining",
+        position, skipped.username, skipped.user_id, remaining,
+    )
+
+    if remaining > 0:
+        still = captcha_queue.status()
+        lines = [f"🗑 Skipped {skipped.username} (id: {skipped.user_id})\n{remaining} still pending:\n"]
+        for i, w in enumerate(still, start=1):
+            waited = int(_time.time() - w.queued_at)
+            lines.append(
+                f"{i}. {w.username} (id: {w.user_id})"
+                f" — part {w.part_index + 1}/{w.total_parts}"
+                f" — waiting {waited}s"
+            )
+        lines.append("\nSend /resume to unblock next, or /skip <n> to skip another.")
+        await telegram_bot.send_message(session, tg_token, tg_chat_id, "\n".join(lines))
+    else:
+        await telegram_bot.send_message(
+            session, tg_token, tg_chat_id,
+            f"🗑 Skipped {skipped.username} (id: {skipped.user_id})\nQueue is now empty ✅",
+        )
 
 
 # ── run ────────────────────────────────────────────────────────────────────

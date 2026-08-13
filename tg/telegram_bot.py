@@ -238,6 +238,8 @@ async def _handle_update(
 
     if text.startswith("/resume"):
         await _cmd_resume(session, token, chat_id)
+    elif text.startswith("/skip"):
+        await _cmd_skip(session, token, chat_id, text)
     elif text.startswith("/queue"):
         await _cmd_status(session, token, chat_id)
     elif text.startswith("/status"):
@@ -321,6 +323,98 @@ async def _cmd_resume(
         )
 
 
+async def _cmd_skip(
+    session: aiohttp.ClientSession,
+    token: str,
+    chat_id: int,
+    text: str,
+) -> None:
+    """
+    /skip <position>  — remove a waiter from the queue without resuming it.
+    The DM to that user is silently cancelled.
+
+    Usage:
+        /skip 1    skip the first (oldest) entry
+        /skip 2    skip the second entry
+        /skip      show queue so you know what to skip
+    """
+    if not captcha_queue.is_paused:
+        await send_message(
+            session, token, chat_id,
+            "✅ Queue is empty — nothing to skip.",
+        )
+        return
+
+    # parse position argument
+    parts = text.strip().split()
+    if len(parts) < 2:
+        # no position given — show queue so they can decide
+        waiters = captcha_queue.status()
+        lines   = [f"⏸ {len(waiters)} in queue — use /skip <number>:\n"]
+        for i, w in enumerate(waiters, start=1):
+            waited = int(time.time() - w.queued_at)
+            lines.append(
+                f"{i}. {w.username} (id: {w.user_id})"
+                f" — part {w.part_index + 1}/{w.total_parts}"
+                f" — waiting {waited}s"
+            )
+        await send_message(session, token, chat_id, "\n".join(lines))
+        return
+
+    try:
+        position = int(parts[1])
+    except ValueError:
+        await send_message(
+            session, token, chat_id,
+            f"❌ Invalid position: '{parts[1]}'\nUsage: /skip 1",
+        )
+        return
+
+    if position < 1:
+        await send_message(
+            session, token, chat_id,
+            "❌ Position must be 1 or higher.",
+        )
+        return
+
+    skipped = captcha_queue.skip(position)
+
+    if skipped is None:
+        total = captcha_queue.pending
+        await send_message(
+            session, token, chat_id,
+            f"❌ Position {position} is out of range — queue has {total} entry(s).\n"
+            f"Send /queue to see current positions.",
+        )
+        return
+
+    remaining = captcha_queue.pending
+    logger.info(
+        "Skipped position %d → %s (id: %s) — %d remaining in queue",
+        position, skipped.username, skipped.user_id, remaining,
+    )
+
+    if remaining > 0:
+        still  = captcha_queue.status()
+        lines  = [f"🗑 Skipped {skipped.username} (id: {skipped.user_id})\n"]
+        lines += [f"{remaining} still pending:\n"]
+        for i, w in enumerate(still, start=1):
+            waited = int(time.time() - w.queued_at)
+            lines.append(
+                f"{i}. {w.username} (id: {w.user_id})"
+                f" — part {w.part_index + 1}/{w.total_parts}"
+                f" — waiting {waited}s"
+            )
+        lines.append("\nSend /resume to unblock next, or /skip <n> to skip another.")
+        await send_message(session, token, chat_id, "\n".join(lines))
+    else:
+        await send_message(
+            session, token, chat_id,
+            f"🗑 Skipped {skipped.username} (id: {skipped.user_id})\n"
+            f"Queue is now empty ✅",
+        )
+
+
 async def _cmd_status(
     session: aiohttp.ClientSession,
     token: str,
@@ -373,8 +467,9 @@ async def _cmd_help(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
             "⚠️  CAPTCHA\n"
-            "/resume    unblock next stuck DM\n"
-            "/queue     show full captcha queue\n"
+            "/resume      unblock next stuck DM\n"
+            "/skip <n>    cancel DM at queue position n\n"
+            "/queue       show full captcha queue\n"
             "\n"
             "📋  LOGS\n"
             "/logs on   enable log forwarding\n"
