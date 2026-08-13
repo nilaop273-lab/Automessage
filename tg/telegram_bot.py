@@ -13,29 +13,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
 
 import aiohttp
 
-from tg.state import gate
+from tg.state import captcha_queue, POST_RESUME_DELAY
 
 logger = logging.getLogger(__name__)
 
 # ── constants ──────────────────────────────────────────────────────────────
-_POLL_TIMEOUT = 30          # long-poll timeout in seconds (Telegram allows up to 50)
-_RETRY_SLEEP  = 5           # sleep between failed poll attempts
+_POLL_TIMEOUT  = 30
 _BASE          = "https://api.telegram.org/bot{token}/{method}"
-
-# Log levels that get forwarded to Telegram.
-# DEBUG is excluded — too noisy. Change to logging.DEBUG if you want everything.
-_TG_LOG_LEVEL = logging.INFO
-
-# Max characters per Telegram message (Telegram hard cap is 4096).
-_TG_MAX_CHARS = 3800
-
-# How many log messages can queue up before we start dropping oldest ones.
-# Prevents unbounded memory growth if Telegram is slow.
-_QUEUE_MAXLEN = 200
+_TG_LOG_LEVEL  = logging.INFO
+_TG_MAX_CHARS  = 3800
+_QUEUE_MAXLEN  = 200
 
 
 # ── low-level helpers ──────────────────────────────────────────────────────
@@ -50,8 +40,6 @@ async def send_message(
     chat_id: int,
     text: str,
 ) -> None:
-    """Fire-and-forget a Telegram message. Logs on failure, never raises."""
-    # Truncate if over Telegram's limit
     if len(text) > _TG_MAX_CHARS:
         text = text[:_TG_MAX_CHARS] + "\n…(truncated)"
     try:
@@ -62,7 +50,6 @@ async def send_message(
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                # Use print here to avoid infinite loop (logger → handler → send_message → logger)
                 print(f"[TG] sendMessage failed {resp.status}: {body}")
     except Exception as exc:
         print(f"[TG] sendMessage exception: {type(exc).__name__}: {exc}")
@@ -73,7 +60,6 @@ async def _get_updates(
     token: str,
     offset: int,
 ) -> list[dict]:
-    """Long-poll /getUpdates. Returns list of update dicts (may be empty)."""
     try:
         async with session.get(
             _url(token, "getUpdates"),
@@ -93,8 +79,6 @@ async def _get_updates(
 
 
 # ── async log queue ────────────────────────────────────────────────────────
-# The sync Handler.emit() drops records into this queue.
-# The async _log_forwarder() coroutine drains it and sends to Telegram.
 
 _log_queue: asyncio.Queue[str] | None = None
 
@@ -107,17 +91,8 @@ def _get_log_queue() -> asyncio.Queue[str]:
 
 
 class TelegramLogHandler(logging.Handler):
-    """
-    Sync logging.Handler that enqueues formatted log records.
-    Safe to call from any thread — uses Queue.put_nowait() which
-    never blocks. If the queue is full the oldest entry is dropped
-    and the new one takes its place.
-    """
-
-    # Loggers whose records we never forward — avoids infinite loops
-    # and stops aiohttp's own debug spam from flooding Telegram.
     _BLOCKED_LOGGERS = {
-        "tg.telegram_bot",      # our own module — would cause send → log → send loop
+        "tg.telegram_bot",
         "aiohttp.access",
         "aiohttp.client",
         "aiohttp.connector",
@@ -125,57 +100,48 @@ class TelegramLogHandler(logging.Handler):
     }
 
     def emit(self, record: logging.LogRecord) -> None:
-        # Block noisy / recursive loggers
         if record.name in self._BLOCKED_LOGGERS:
             return
         if record.name.startswith("aiohttp."):
             return
-
         try:
             msg = self.format(record)
             q = _get_log_queue()
             if q.full():
-                # Drop oldest to make room — deque trick via get_nowait
                 try:
                     q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
             q.put_nowait(msg)
         except Exception:
-            # Never let the handler crash the bot
             pass
 
 
+async def run_log_forwarder(token: str, chat_id: int) -> None:
+    """Public entry point — start this as an asyncio task to forward logs to Telegram.
+    Called directly from main.py in WATCHDOG_MODE since run_telegram_bot() is skipped."""
+    await _log_forwarder(token, chat_id)
+
+
 async def _log_forwarder(token: str, chat_id: int) -> None:
-    """
-    Drains the log queue and ships each record to Telegram.
-    Runs as a background task inside run_telegram_bot().
-    Batches rapid-fire logs into one message (up to 10 lines or 2s gap)
-    so Telegram's rate limit (30 msg/s) is never touched.
-    """
     q = _get_log_queue()
     batch: list[str] = []
-    BATCH_SIZE = 10
-    BATCH_TIMEOUT = 2.0          # seconds to wait before flushing a partial batch
+    BATCH_SIZE    = 10
+    BATCH_TIMEOUT = 2.0
 
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # Block until first item arrives
                 first = await asyncio.wait_for(q.get(), timeout=BATCH_TIMEOUT)
                 batch.append(first)
-
-                # Drain any more that arrived at the same time (non-blocking)
                 while len(batch) < BATCH_SIZE:
                     try:
                         batch.append(q.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-
             except asyncio.TimeoutError:
-                pass  # no new logs in timeout window, flush what we have
+                pass
             except asyncio.CancelledError:
-                # Flush remaining before exit
                 if batch:
                     await send_message(session, token, chat_id, "\n".join(batch))
                 raise
@@ -186,10 +152,6 @@ async def _log_forwarder(token: str, chat_id: int) -> None:
 
 
 def attach_log_handler(token: str, chat_id: int) -> None:
-    """
-    Attach TelegramLogHandler to the root logger.
-    Call once from configure() — after this every log at INFO+ goes to Telegram.
-    """
     handler = TelegramLogHandler(level=_TG_LOG_LEVEL)
     handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -199,25 +161,16 @@ def attach_log_handler(token: str, chat_id: int) -> None:
     logger.info("Telegram log forwarding active (level: %s)", logging.getLevelName(_TG_LOG_LEVEL))
 
 
+# ── resume lock — prevents two /resume being processed simultaneously ──────
+_resume_in_progress: bool = False
+
+
 # ── main coroutine ─────────────────────────────────────────────────────────
 
 async def run_telegram_bot(token: str, chat_id: int) -> None:
-    """
-    Long-poll loop. Runs forever alongside the discord client.
-
-    Recognized commands (from your chat_id only):
-        /resume  — open the pause gate, dm_sender wakes up and retries
-        /status  — reply with whether the bot is currently paused
-        /logs on — enable log forwarding (default: already on)
-        /logs off — mute log forwarding (captcha alerts still come through)
-    """
     logger.info("Telegram bot started — polling for commands")
-
-    # Drain stale updates from before this session so we don't accidentally
-    # /resume a gate that was set by a previous run's leftover message.
     offset = await _drain_stale_updates(token)
 
-    # Start the log forwarder as a sibling task
     forwarder_task = asyncio.create_task(
         _log_forwarder(token, chat_id),
         name="tg-log-forwarder",
@@ -227,11 +180,9 @@ async def run_telegram_bot(token: str, chat_id: int) -> None:
         async with aiohttp.ClientSession() as session:
             while True:
                 updates = await _get_updates(session, token, offset)
-
                 if not updates:
-                    await asyncio.sleep(0)   # yield to event loop
+                    await asyncio.sleep(0)
                     continue
-
                 for update in updates:
                     offset = update["update_id"] + 1
                     await _handle_update(session, token, chat_id, update)
@@ -244,10 +195,6 @@ async def run_telegram_bot(token: str, chat_id: int) -> None:
 
 
 async def _drain_stale_updates(token: str) -> int:
-    """
-    Fetch all pending updates with timeout=0 to get current offset,
-    then discard them. Prevents old /resume commands from firing on startup.
-    """
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(
@@ -278,7 +225,6 @@ async def _handle_update(
     chat_id: int,
     update: dict,
 ) -> None:
-    """Route a single Telegram update to the right handler."""
     message = update.get("message") or update.get("edited_message")
     if not message:
         return
@@ -286,30 +232,24 @@ async def _handle_update(
     sender_id: int = message.get("chat", {}).get("id", -1)
     text: str = (message.get("text") or "").strip().lower()
 
-    # Only accept commands from YOUR chat_id — ignore everything else silently.
     if sender_id != chat_id:
         logger.debug("Ignoring message from unknown chat_id %d", sender_id)
         return
 
     if text.startswith("/resume"):
         await _cmd_resume(session, token, chat_id)
-
+    elif text.startswith("/queue"):
+        await _cmd_status(session, token, chat_id)
     elif text.startswith("/status"):
         await _cmd_status(session, token, chat_id)
-
     elif text.startswith("/logs"):
         await _cmd_logs(session, token, chat_id, text)
-
+    elif text.startswith("/help"):
+        await _cmd_help(session, token, chat_id)
     else:
         await send_message(
             session, token, chat_id,
-            (
-                "Unknown command.\n\n"
-                "/resume — resume DM sending after captcha\n"
-                "/status — check pause state\n"
-                "/logs on — enable log forwarding\n"
-                "/logs off — mute log forwarding"
-            ),
+            f"❓ Unknown command: {text}\nSend /help for the full list.",
         )
 
 
@@ -318,26 +258,67 @@ async def _cmd_resume(
     token: str,
     chat_id: int,
 ) -> None:
-    if not gate.is_paused:
+    global _resume_in_progress
+
+    # Guard: don't allow two /resume to run concurrently
+    if _resume_in_progress:
         await send_message(
             session, token, chat_id,
-            "✅ Bot is not paused — DMs are already running.",
+            "⏳ Resume already in progress — please wait for it to finish.",
         )
         return
 
-    ctx = gate.context
-    gate.resume()
-    logger.info(
-        "Gate opened by /resume — retrying DM to %s (user_id=%d) from part %d/%d",
-        ctx.username, ctx.user_id, ctx.part_index + 1, ctx.total_parts,
-    )
+    if not captcha_queue.is_paused:
+        await send_message(
+            session, token, chat_id,
+            "✅ No captchas pending — DMs are running normally.",
+        )
+        return
+
+    # Show who we're about to resume
+    snapshot = captcha_queue.status()
+    next_waiter = snapshot[0]
+    remaining_after = len(snapshot) - 1
+
     await send_message(
         session, token, chat_id,
         (
-            f"▶️ Resuming DM to {ctx.username} (id: {ctx.user_id})\n"
-            f"Retrying from part {ctx.part_index + 1}/{ctx.total_parts}"
+            f"⏳ Resuming {next_waiter.username} (id: {next_waiter.user_id})\n"
+            f"Part: {next_waiter.part_index + 1}/{next_waiter.total_parts}\n"
+            f"Waiting {int(POST_RESUME_DELAY)}s before retrying to give Discord breathing room…"
         ),
     )
+
+    _resume_in_progress = True
+    try:
+        resumed = await captcha_queue.resume_next()
+    finally:
+        _resume_in_progress = False
+
+    if resumed is None:
+        await send_message(session, token, chat_id, "⚠️ Queue was empty by the time resume ran.")
+        return
+
+    logger.info(
+        "Gate opened by /resume — retrying DM to %s (user_id=%d) part %d/%d",
+        resumed.username, resumed.user_id,
+        resumed.part_index + 1, resumed.total_parts,
+    )
+
+    if remaining_after > 0:
+        # Build a summary of who's still waiting
+        still_waiting = captcha_queue.status()
+        lines = [f"▶️ Resumed {resumed.username} — {remaining_after} still pending:\n"]
+        for i, w in enumerate(still_waiting, start=1):
+            waited = int(time.time() - w.queued_at)
+            lines.append(f"{i}. {w.username} (id: {w.user_id}) — part {w.part_index + 1}/{w.total_parts} — waiting {waited}s")
+        lines.append("\nSend /resume again to unblock the next one.")
+        await send_message(session, token, chat_id, "\n".join(lines))
+    else:
+        await send_message(
+            session, token, chat_id,
+            f"▶️ Resumed {resumed.username} — queue empty ✅",
+        )
 
 
 async def _cmd_status(
@@ -345,26 +326,69 @@ async def _cmd_status(
     token: str,
     chat_id: int,
 ) -> None:
-    if gate.is_paused:
-        ctx = gate.context
+    if not captcha_queue.is_paused:
         await send_message(
             session, token, chat_id,
-            (
-                f"⏸ PAUSED\n"
-                f"Stuck on: {ctx.username} (id: {ctx.user_id})\n"
-                f"Part: {ctx.part_index + 1}/{ctx.total_parts}\n"
-                f"Error: {ctx.last_error}"
-            ),
+            "✅ Running normally — no captcha queue.",
         )
-    else:
-        await send_message(
-            session, token, chat_id,
-            "✅ Running normally — no captcha pause active.",
+        return
+
+    waiters = captcha_queue.status()
+    lines = [f"⏸ {len(waiters)} captcha(s) pending:\n"]
+    for i, w in enumerate(waiters, start=1):
+        waited = int(time.time() - w.queued_at)
+        lines.append(
+            f"{i}. {w.username} (id: {w.user_id})\n"
+            f"   Part: {w.part_index + 1}/{w.total_parts}\n"
+            f"   Waiting: {waited}s\n"
+            f"   Error: {w.last_error}"
         )
+    lines.append("\nSend /resume to unblock the next one in queue.")
+    await send_message(session, token, chat_id, "\n".join(lines))
 
 
-# mute flag — toggled by /logs on|off
+# mute flag — toggled by /logs on|off or watchdog signal
 _logs_muted: bool = False
+
+
+def set_logs_muted(value: bool) -> None:
+    """Called by main.py signal poller when watchdog forwards /logs on|off."""
+    global _logs_muted
+    _logs_muted = value
+
+
+def get_logs_muted() -> bool:
+    return _logs_muted
+
+
+async def _cmd_help(
+    session: aiohttp.ClientSession,
+    token: str,
+    chat_id: int,
+) -> None:
+    await send_message(
+        session, token, chat_id,
+        (
+            "📖  COMMAND LIST\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\n"
+            "⚠️  CAPTCHA\n"
+            "/resume    unblock next stuck DM\n"
+            "/queue     show full captcha queue\n"
+            "\n"
+            "📋  LOGS\n"
+            "/logs on   enable log forwarding\n"
+            "/logs off  mute log forwarding\n"
+            "/logs      check current log state\n"
+            "\n"
+            "❓  OTHER\n"
+            "/help      show this message\n"
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💡  captcha alerts always fire even with /logs off\n"
+            "💡  use /start /stop /status via watchdog"
+        ),
+    )
 
 
 async def _cmd_logs(
@@ -387,35 +411,43 @@ async def _cmd_logs(
 
 # ── notification helper (called from dm_sender) ────────────────────────────
 
-_tg_token: str = ""
+_tg_token:   str = ""
 _tg_chat_id: int = 0
 
 
 def configure(token: str, chat_id: int) -> None:
-    """Call once from main.py before starting the loop."""
     global _tg_token, _tg_chat_id
-    _tg_token = token
+    _tg_token  = token
     _tg_chat_id = chat_id
     attach_log_handler(token, chat_id)
 
 
-async def notify_captcha(username: str, user_id: int, part: int, total: int, error: str) -> None:
+async def notify_captcha(
+    username: str,
+    user_id: int,
+    part: int,
+    total: int,
+    error: str,
+    queue_size: int = 1,
+) -> None:
     """
-    Send a Telegram alert to yourself when captcha fires.
-    Called from dm_sender after retries are exhausted.
+    Immediate captcha alert — bypasses log queue, fires its own aiohttp session.
     Always sends regardless of _logs_muted.
+    queue_size = how many are now pending (including this one).
     """
     if not _tg_token or not _tg_chat_id:
         logger.warning("Telegram not configured — captcha alert skipped")
         return
 
     text = (
-        f"⚠️ CAPTCHA HIT\n"
+        f"⚠️ CAPTCHA HIT ({queue_size} in queue)\n"
         f"User: {username} (id: {user_id})\n"
         f"Part: {part}/{total}\n"
         f"Error: {error}\n\n"
         f"Go solve the captcha in Discord mobile, then send /resume here."
     )
+    if queue_size > 1:
+        text += f"\n\n📋 {queue_size - 1} other captcha(s) already waiting — each /resume handles one."
 
     async with aiohttp.ClientSession() as session:
         await send_message(session, _tg_token, _tg_chat_id, text)

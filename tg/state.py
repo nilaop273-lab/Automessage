@@ -1,65 +1,86 @@
 from __future__ import annotations
 
-# *state.py — the single nerve between dm_sender and telegram_bot*
-# dm_sender clears the gate when captcha hits. telegram_bot sets it on /resume.
-# Both import the same `gate` singleton. No IPC, no pipes, no polling —
-# same process, same event loop, one asyncio.Event doing all the work.
+# *state.py — queue-based pause gate*
+# Each stuck DM sequence registers its own private asyncio.Event.
+# /resume pops the oldest waiter (FIFO), sleeps POST_RESUME_DELAY,
+# then fires only that one Event. Fully serialized — no simultaneous
+# Discord hits, no cross-wakeup between unrelated sequences.
 
 import asyncio
-from dataclasses import dataclass
+import time
+from collections import deque
+from dataclasses import dataclass, field
+
+
+POST_RESUME_DELAY: float = 30.0     # seconds to wait after /resume before retrying
 
 
 @dataclass
-class PauseContext:
-    """Snapshot of what got frozen so the Telegram message is informative."""
-    user_id: int = 0
-    username: str = ""
-    part_index: int = 0       # 0-based index of the part that stalled
-    total_parts: int = 0
-    last_error: str = ""
+class Waiter:
+    """One stuck DM sequence waiting for manual resume."""
+    user_id:     int
+    username:    str
+    part_index:  int          # 0-based
+    total_parts: int
+    last_error:  str
+    queued_at:   float = field(default_factory=time.time)
+    _event:      asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def wait(self) -> None:
+        """Block the DM sequence here until resume() fires us."""
+        await self._event.wait()
+
+    def resume(self) -> None:
+        """Wake this specific sequence."""
+        self._event.set()
 
 
-class _PauseGate:
+class CaptchaQueue:
     """
-    Thin wrapper around asyncio.Event.
+    FIFO queue of Waiter objects.
 
-    State machine:
-        OPEN  (event.is_set()  == True)  — normal run, nothing paused
-        CLOSED (event.is_set() == False) — captcha hit, dm_sender is blocked
-
-    dm_sender  →  gate.pause(ctx)   to freeze
-    telegram   →  gate.resume()     to unfreeze
-    dm_sender  →  await gate.wait() to block until open
+    dm_sender  → queue.add(waiter)       register a stuck sequence
+    telegram   → queue.resume_next()     pop oldest, sleep, fire it
+    telegram   → queue.status()          snapshot for /status command
     """
 
     def __init__(self) -> None:
-        # Lazy-init after the event loop is running.
-        self._event: asyncio.Event | None = None
-        self.context: PauseContext = PauseContext()
+        self._q: deque[Waiter] = deque()
+        self._lock = asyncio.Lock()
 
-    def _ev(self) -> asyncio.Event:
-        if self._event is None:
-            self._event = asyncio.Event()
-            self._event.set()          # starts OPEN
-        return self._event
+    @property
+    def pending(self) -> int:
+        return len(self._q)
 
     @property
     def is_paused(self) -> bool:
-        return not self._ev().is_set()
+        return len(self._q) > 0
 
-    def pause(self, ctx: PauseContext) -> None:
-        """Freeze the gate and record what got stuck."""
-        self.context = ctx
-        self._ev().clear()
+    def add(self, waiter: Waiter) -> None:
+        """Register a new stuck sequence. Called from dm_sender (sync-safe)."""
+        self._q.append(waiter)
 
-    def resume(self) -> None:
-        """Open the gate — dm_sender wakes up on the next await."""
-        self._ev().set()
+    async def resume_next(self) -> Waiter | None:
+        """
+        Pop the oldest waiter, sleep POST_RESUME_DELAY, fire its event.
+        Returns the Waiter that was resumed, or None if queue was empty.
+        """
+        async with self._lock:
+            if not self._q:
+                return None
+            waiter = self._q.popleft()
 
-    async def wait(self) -> None:
-        """Block until the gate is open. No-op if already open."""
-        await self._ev().wait()
+        # Sleep outside the lock so other operations aren't blocked
+        if POST_RESUME_DELAY > 0:
+            await asyncio.sleep(POST_RESUME_DELAY)
+
+        waiter.resume()
+        return waiter
+
+    def status(self) -> list[Waiter]:
+        """Return a snapshot of all pending waiters in queue order."""
+        return list(self._q)
 
 
 # ── singleton ──────────────────────────────────────────────────────────────
-gate = _PauseGate()
+captcha_queue = CaptchaQueue()

@@ -1,29 +1,37 @@
 from __future__ import annotations
 
 # *storage.py — SQLite layer*
-# Existing tables: processed_messages, dm_cooldowns  (unchanged)
-# New table:       dm_queue  — crash-safe resume state for captcha pauses
 #
-# dm_queue schema:
-#   queue_id    — autoincrement PK
-#   user_id     — who we're DMing
-#   username    — display name for Telegram alerts
-#   part_index  — which part (0-based) we're currently on
-#   total_parts — total number of parts in the message
-#   parts_json  — JSON array of all message parts (full list, not just remaining)
-#   status      — 'pending' | 'paused' | 'done'
-#   created_at  — unix timestamp
+# Tables:
+#   processed_messages — dedup guard for incoming Discord messages
+#   dm_cooldowns       — per-user DM cooldown tracker
+#   dm_queue           — crash-safe resume state for captcha pauses
+#
+# Duplicate DM fix:
+#   dm_cooldowns previously only tracked the LAST dm time, so if a user
+#   posted in two monitored channels quickly, both could pass is_on_cooldown()
+#   before record_user_dm() was called for the first one.
+#   Fix: dm_sent_log table records every DM attempt with a unique constraint
+#   on (user_id, session_key) where session_key is set once per bot run.
+#   is_already_dmed_this_session() gates sending before any delay fires.
 
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
-_DB_PATH = Path(__file__).resolve().parent.parent / "bot_state.db"
-_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
-_conn: sqlite3.Connection | None = None
+_DB_PATH = Path(__file__).resolve().parent.parent / "bot_state.db"
+_lock    = threading.Lock()
+_conn:   sqlite3.Connection | None = None
+
+# ── session key — unique per process run ──────────────────────────────────
+# Prevents cross-session false positives while blocking same-session dupes.
+_SESSION_KEY: str = str(os.getpid())
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -35,15 +43,16 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create tables if they don't exist yet. Call once at startup."""
+    """Create all tables if they don't exist. Call once at startup."""
     conn = _get_connection()
     with _lock:
+        # ── existing tables (unchanged) ────────────────────────────────────
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS processed_messages (
-                message_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                processed_at REAL NOT NULL,
+                message_id  INTEGER NOT NULL,
+                kind        TEXT    NOT NULL,
+                processed_at REAL   NOT NULL,
                 PRIMARY KEY (message_id, kind)
             )
             """
@@ -51,12 +60,11 @@ def init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS dm_cooldowns (
-                user_id INTEGER PRIMARY KEY,
-                last_dm_at REAL NOT NULL
+                user_id     INTEGER PRIMARY KEY,
+                last_dm_at  REAL    NOT NULL
             )
             """
         )
-        # ── new: captcha-safe queue ────────────────────────────────────────
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS dm_queue (
@@ -71,10 +79,25 @@ def init_db() -> None:
             )
             """
         )
+        # ── NEW: per-session DM dedup log ──────────────────────────────────
+        # Prevents the race where two messages arrive simultaneously from
+        # different monitored channels for the same user, both pass
+        # is_on_cooldown() before either records the DM, and both send.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_sent_log (
+                user_id     INTEGER NOT NULL,
+                session_key TEXT    NOT NULL,
+                sent_at     REAL    NOT NULL,
+                PRIMARY KEY (user_id, session_key)
+            )
+            """
+        )
         conn.commit()
+    logger.debug("[DB] Tables initialised at %s", _DB_PATH)
 
 
-# ── existing helpers (unchanged) ───────────────────────────────────────────
+# ── processed messages ─────────────────────────────────────────────────────
 
 def is_message_processed(message_id: int, kind: str) -> bool:
     conn = _get_connection()
@@ -96,10 +119,11 @@ def mark_message_processed(message_id: int, kind: str) -> None:
         conn.commit()
 
 
+# ── dm cooldowns ───────────────────────────────────────────────────────────
+
 def is_user_on_cooldown(user_id: int, cooldown_seconds: int) -> bool:
     if cooldown_seconds == 0:
         return False
-
     conn = _get_connection()
     with _lock:
         cur = conn.execute(
@@ -107,12 +131,9 @@ def is_user_on_cooldown(user_id: int, cooldown_seconds: int) -> bool:
             (user_id,),
         )
         row = cur.fetchone()
-
     if row is None:
         return False
-
-    last_sent = row[0]
-    return (time.time() - last_sent) < cooldown_seconds
+    return (time.time() - row[0]) < cooldown_seconds
 
 
 def record_user_dm(user_id: int) -> None:
@@ -126,39 +147,69 @@ def record_user_dm(user_id: int) -> None:
             (user_id, time.time()),
         )
         conn.commit()
+    logger.debug("[DB] Cooldown recorded for user %s", user_id)
 
 
-def cleanup_old_processed_messages(older_than_seconds: int = 30 * 24 * 3600) -> None:
-    """Purge processed-message records older than N seconds (default 30 days)."""
-    conn = _get_connection()
-    cutoff = time.time() - older_than_seconds
-    with _lock:
-        conn.execute("DELETE FROM processed_messages WHERE processed_at < ?", (cutoff,))
-        conn.commit()
+# ── session-scoped DM dedup (duplicate DM fix) ─────────────────────────────
 
-
-# ── new: dm_queue helpers ──────────────────────────────────────────────────
-
-def queue_create(user_id: int, username: str, parts: list[str]) -> int:
+def claim_dm_slot(user_id: int) -> bool:
     """
-    Insert a new dm_queue row before we start sending.
-    Returns the queue_id so dm_sender can update it as it progresses.
+    Atomically claim the DM slot for this user in the current session.
+
+    Returns True  → slot claimed, safe to send
+    Returns False → another coroutine already claimed it this session,
+                    skip sending entirely (duplicate prevention)
+
+    Uses INSERT OR IGNORE with a UNIQUE (user_id, session_key) constraint
+    so even if two coroutines race here simultaneously, only one wins.
     """
     conn = _get_connection()
     with _lock:
         cur = conn.execute(
+            "INSERT OR IGNORE INTO dm_sent_log (user_id, session_key, sent_at) VALUES (?, ?, ?)",
+            (user_id, _SESSION_KEY, time.time()),
+        )
+        conn.commit()
+        claimed = cur.rowcount == 1   # 1 = inserted (won the race), 0 = already existed
+
+    if not claimed:
+        logger.info(
+            "[DB] DM slot already claimed for user %s this session — duplicate blocked",
+            user_id,
+        )
+    return claimed
+
+
+def cleanup_session_log(session_key: str | None = None) -> None:
+    """Purge dm_sent_log rows for a given session (default: current session)."""
+    conn = _get_connection()
+    key  = session_key or _SESSION_KEY
+    with _lock:
+        conn.execute("DELETE FROM dm_sent_log WHERE session_key = ?", (key,))
+        conn.commit()
+    logger.debug("[DB] Cleared dm_sent_log for session %s", key)
+
+
+# ── dm_queue helpers ───────────────────────────────────────────────────────
+
+def queue_create(user_id: int, username: str, parts: list[str]) -> int:
+    conn = _get_connection()
+    with _lock:
+        cur = conn.execute(
             """
-            INSERT INTO dm_queue (user_id, username, part_index, total_parts, parts_json, status, created_at)
+            INSERT INTO dm_queue
+                (user_id, username, part_index, total_parts, parts_json, status, created_at)
             VALUES (?, ?, 0, ?, ?, 'pending', ?)
             """,
             (user_id, username, len(parts), json.dumps(parts), time.time()),
         )
         conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        row_id = cur.lastrowid
+    logger.debug("[DB] dm_queue row %d created for user %s", row_id, user_id)
+    return row_id  # type: ignore[return-value]
 
 
 def queue_update_progress(queue_id: int, part_index: int, status: str) -> None:
-    """Advance part_index and/or flip status ('pending' | 'paused' | 'done')."""
     conn = _get_connection()
     with _lock:
         conn.execute(
@@ -169,7 +220,6 @@ def queue_update_progress(queue_id: int, part_index: int, status: str) -> None:
 
 
 def queue_get(queue_id: int) -> dict | None:
-    """Fetch a single dm_queue row as a dict. Returns None if not found."""
     conn = _get_connection()
     with _lock:
         cur = conn.execute(
@@ -191,9 +241,19 @@ def queue_get(queue_id: int) -> dict | None:
     }
 
 
+# ── housekeeping ───────────────────────────────────────────────────────────
+
+def cleanup_old_processed_messages(older_than_seconds: int = 30 * 24 * 3600) -> None:
+    conn   = _get_connection()
+    cutoff = time.time() - older_than_seconds
+    with _lock:
+        conn.execute("DELETE FROM processed_messages WHERE processed_at < ?", (cutoff,))
+        conn.commit()
+    logger.debug("[DB] Pruned processed_messages older than %ds", older_than_seconds)
+
+
 def queue_cleanup_done(older_than_seconds: int = 7 * 24 * 3600) -> None:
-    """Prune 'done' rows older than N seconds (default 7 days)."""
-    conn = _get_connection()
+    conn   = _get_connection()
     cutoff = time.time() - older_than_seconds
     with _lock:
         conn.execute(
@@ -201,3 +261,4 @@ def queue_cleanup_done(older_than_seconds: int = 7 * 24 * 3600) -> None:
             (cutoff,),
         )
         conn.commit()
+    logger.debug("[DB] Pruned done dm_queue rows older than %ds", older_than_seconds)
