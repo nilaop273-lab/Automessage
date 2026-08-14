@@ -227,6 +227,17 @@ async def _send_part(
 
                 await waiter.wait()
 
+                # ── skip check ─────────────────────────────────────────────
+                # waiter.abort() fires the event with skipped=True.
+                # If that's what woke us, abort the sequence — do NOT retry.
+                if waiter.skipped:
+                    logger.info(
+                        "[DM] Sequence skipped via /skip → %s (id: %s) — aborting part %d/%d",
+                        username, author.id, part_human_index, total,
+                    )
+                    storage.queue_update_progress(queue_id, index, "paused")
+                    return False
+
                 logger.info(
                     "[DM] Resumed → retrying part %d/%d for %s (id: %s)",
                     part_human_index, total, username, author.id,

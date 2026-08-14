@@ -98,7 +98,18 @@ async def handle_paid_editor_request(
         return
     if message.channel.id != settings.paid_request_channel_id:
         return
-    if message.author.name != settings.paid_request_trigger_author:
+
+    # ── author match — checks name, display_name, and global_name ─────────
+    # Bots may expose their name differently from regular users so we check
+    # all three fields. Any one matching is enough to proceed.
+    trigger = settings.paid_request_trigger_author.lower()
+    author  = message.author
+    name_candidates = {
+        getattr(author, "name",         "").lower(),
+        getattr(author, "display_name", "").lower(),
+        getattr(author, "global_name",  "").lower(),
+    }
+    if trigger not in name_candidates:
         return
 
     # ── duplicate guard ────────────────────────────────────────────────────
@@ -175,12 +186,19 @@ async def handle_incoming_message(
     self_user_id: int,
     client: discord.Client,
 ) -> None:
-    # paid request runs independently of the monitored-channel filter
+    # ── paid request runs FIRST — before any bot/channel filters ──────────
+    # This means bot messages in the paid channel are NOT ignored here.
+    # The bot filter below only applies to the auto-DM monitored channels.
     await handle_paid_editor_request(message, settings, client)
 
+    # ── auto-DM section — apply all filters ───────────────────────────────
     if message.channel.id not in settings.monitored_channel_ids:
         return
     if settings.ignore_bot_messages and message.author.bot:
+        logger.debug(
+            "[DM] Ignoring bot message from %s (id: %s) in monitored channel",
+            message.author, message.author.id,
+        )
         return
     if message.author.id == self_user_id:
         return
