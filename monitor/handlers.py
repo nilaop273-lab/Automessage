@@ -102,13 +102,14 @@ async def handle_paid_editor_request(
     # ── author match — checks name, display_name, and global_name ─────────
     # Bots may expose their name differently from regular users so we check
     # all three fields. Any one matching is enough to proceed.
+    # global_name can be None on bot accounts — guard every field.
     trigger = settings.paid_request_trigger_author.lower()
     author  = message.author
-    name_candidates = {
-        getattr(author, "name",         "").lower(),
-        getattr(author, "display_name", "").lower(),
-        getattr(author, "global_name",  "").lower(),
-    }
+    name_candidates: set[str] = set()
+    for attr in ("name", "display_name", "global_name"):
+        val = getattr(author, attr, None)
+        if isinstance(val, str) and val:
+            name_candidates.add(val.lower())
     if trigger not in name_candidates:
         return
 
