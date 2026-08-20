@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 
-POST_RESUME_DELAY: float = 30.0     # seconds to wait after /resume before retrying
+POST_RESUME_DELAY: float = 10.0     # seconds to wait after /resume before retrying
 
 
 @dataclass
