@@ -1,73 +1,112 @@
-from __future__ import annotations
-
+# [context: discord-selfbot-monitor, os: linux, arch: x86_64]
 import logging
 
 import discord
 
-from config import Settings
-from monitor.handlers import handle_incoming_message
+from monitor.handlers import handle_message
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("monitor")
 
 
-def create_client(settings: Settings) -> discord.Client:
-    class MonitorClient(discord.Client):
-        async def on_ready(self) -> None:
-            user = self.user
-            name = user.name if user else "unknown"
-            uid  = user.id   if user else "?"
+class MonitorClient(discord.Client):
+    def __init__(self, settings, storage, dm_sender=None):
+        # No Intents — selfbots do not need them.
+        # The previous working version used super().__init__() bare.
+        super().__init__()
+        self.cfg = settings
+        self._storage = storage
+        self._dm_sender = dm_sender
 
-            ch_ids = sorted(settings.monitored_channel_ids)
+    async def on_ready(self):
+        user = self.user
+        name = user.name if user else "unknown"
+        uid = user.id if user else "?"
 
-            # auto-dm line
-            if settings.auto_dm_enabled:
-                dm_line = (
-                    f"  auto-dm    ON  •  {len(settings.auto_dm_messages)} variant(s)"
-                    f"  •  {settings.auto_dm_rotation}"
-                    f"  •  cooldown {settings.dm_cooldown_seconds}s"
-                    f"  •  delay {settings.dm_delay_min_seconds:.0f}–{settings.dm_delay_max_seconds:.0f}s"
+        banner = (
+            "┌─ SELF BOT STARTED ─\n"
+            f"│ account={name} ({uid})\n"
+            f"│ channel={self.cfg.paid_request_channel_id}\n"
+            f"│ trigger_author={self.cfg.paid_request_trigger_author}\n"
+            f"│ cooldown={self.cfg.dm_cooldown_seconds}s\n"
+            f"│ initial_delay={self.cfg.dm_delay_min_seconds}-"
+            f"{self.cfg.dm_delay_max_seconds}s\n"
+            f"│ part_delay={self.cfg.part_delay_min_seconds}-"
+            f"{self.cfg.part_delay_max_seconds}s\n"
+            f"│ pool_size={len(self.cfg.dm_messages)}\n"
+            "└─ READY"
+        )
+        log.info("[PAID] %s", banner)
+
+    async def on_message(self, message):
+        if self.user is None or message.author.id == self.user.id:
+            return
+
+        if message.channel.id != self.cfg.paid_request_channel_id:
+            return
+
+        content = getattr(message, "content", "") or ""
+        embeds = getattr(message, "embeds", []) or []
+
+        log.info(
+            "[PAID] saw message in channel "
+            "message_id=%s author_name=%r display_name=%r "
+            "global_name=%r bot=%s content=%r embeds=%d",
+            message.id,
+            getattr(message.author, "name", None),
+            getattr(message.author, "display_name", None),
+            getattr(message.author, "global_name", None),
+            getattr(message.author, "bot", False),
+            content,
+            len(embeds),
+        )
+
+        combined_content = content
+
+        # If content and embeds are empty, try to get the referenced message
+        if not content and not embeds:
+            referenced = None
+            ref = getattr(message, "reference", None)
+            if ref is not None:
+                ref_id = getattr(ref, "message_id", None)
+                if ref_id:
+                    try:
+                        referenced = await message.channel.fetch_message(ref_id)
+                    except Exception as exc:
+                        log.error(
+                            "[PAID] failed to fetch referenced message %s: %s: %s",
+                            ref_id, type(exc).__name__, exc,
+                        )
+            if referenced is not None:
+                ref_content = getattr(referenced, "content", "") or ""
+                ref_embeds = getattr(referenced, "embeds", []) or []
+                log.info(
+                    "[PAID] referenced message found ref_id=%s content=%r embeds=%d",
+                    referenced.id, ref_content, len(ref_embeds),
                 )
-            else:
-                dm_line = "  auto-dm    OFF"
+                combined_content = ref_content
+                if not combined_content:
+                    buf = []
+                    for e in ref_embeds:
+                        t = getattr(e, "title", None)
+                        d = getattr(e, "description", None)
+                        if t:
+                            buf.append(t)
+                        if d:
+                            buf.append(d)
+                        for f in getattr(e, "fields", []) or []:
+                            buf.append(f"{getattr(f, 'name', '')} {getattr(f, 'value', '')}")
+                    combined_content = "\n".join(buf)
 
-            # paid request line
-            if settings.paid_request_channel_id:
-                paid_line = (
-                    f"  paid req   channel {settings.paid_request_channel_id}"
-                    f"  •  author: {settings.paid_request_trigger_author}"
+            if not combined_content:
+                log.warning(
+                    "[PAID] no content, no referenced text. Message has no usable payload."
                 )
-            else:
-                paid_line = "  paid req   disabled"
 
-            # keyword line
-            kw_line = (
-                f"  keywords   {', '.join(settings.keyword_filter)}"
-                if settings.keyword_filter
-                else "  keywords   none (all messages pass)"
-            )
+        if self._dm_sender is None:
+            log.error("dm_sender not set — ignoring message")
+            return
 
-            # channel list
-            ch_lines = "\n".join(f"               • {ch}" for ch in ch_ids)
-
-            banner = (
-                "\n"
-                "  ╔══════════════════════════════════════════════╗\n"
-                "  ║              BOT ONLINE                      ║\n"
-                "  ╚══════════════════════════════════════════════╝\n"
-                f"  account    {name}  (id: {uid})\n"
-                f"  channels   {len(ch_ids)} monitored\n"
-                f"{ch_lines}\n"
-                f"{dm_line}\n"
-                f"{paid_line}\n"
-                f"{kw_line}\n"
-                "  ══════════════════════════════════════════════"
-            )
-
-            logger.info(banner)
-
-        async def on_message(self, message: discord.Message) -> None:
-            if self.user is None:
-                return
-            await handle_incoming_message(message, settings, self.user.id, self)
-
-    return MonitorClient()
+        await handle_message(
+            message, self.cfg, self._storage, self._dm_sender, self,
+            content_override=combined_content,
+        )
