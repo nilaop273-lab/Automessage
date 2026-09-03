@@ -1,202 +1,277 @@
-# [context: discord-selfbot-monitor, os: linux, arch: x86_64]
-import logging
+from __future__ import annotations
+
 import re
-import time
+import logging
+from datetime import timezone
 
-log = logging.getLogger("handlers")
+import discord
 
-REQUEST_PATTERN = re.compile(r"request by:\s*<@!?(\d+)>", re.IGNORECASE)
-# keep dots and underscores (usernames like soup.xd_ / ProVfx)
-REQUEST_PATTERN_NAME = re.compile(
-    r"request by:\s*@?([A-Za-z0-9._]+)", re.IGNORECASE
-)
+from config import Settings
+from monitor import dm_sender, storage
 
+logger = logging.getLogger(__name__)
 
-def _strip_markdown(text):
-    # only strip formatting markers that are NOT part of usernames
-    # do NOT remove single underscores — they appear in modern usernames
-    for marker in ("***", "__", "~~", "**"):
-        text = text.replace(marker, "")
-    # remove italic * only when not mid-word
-    text = re.sub(r"(?<!\w)\*(?!\w)", "", text)
-    return text
+REQUEST_PATTERN    = re.compile(r"request by:\s*<@!?(\d+)>", re.IGNORECASE)
+_MARKDOWN_EMPHASIS = re.compile(r"\*{1,3}|_{1,3}|~~")
 
 
-def _author_matches(message, trigger_author):
-    author = message.author
-    for attr in ("name", "display_name", "global_name"):
-        value = getattr(author, attr, None)
-        if value is not None and value == trigger_author:
-            return True
-    return False
+# ── text helpers ───────────────────────────────────────────────────────────
+
+def strip_markdown_emphasis(text: str) -> str:
+    return _MARKDOWN_EMPHASIS.sub("", text)
 
 
-def _combined_content(message, content_override=None):
-    if content_override is not None:
-        parts = [content_override]
-    else:
-        parts = [message.content or ""]
+async def resolve_message_content(message: discord.Message) -> str:
+    if message.content:
+        return message.content
+    try:
+        async for fetched in message.channel.history(limit=1, around=message):
+            if fetched.id == message.id:
+                return fetched.content or ""
+    except discord.HTTPException as exc:
+        logger.warning(
+            "[MSG %s] Could not fetch content from history: %s",
+            message.id, exc,
+        )
+    return ""
+
+
+def extract_embed_text(message: discord.Message) -> str:
+    parts: list[str] = []
     for embed in message.embeds:
-        if embed.title:
-            parts.append(embed.title)
-        if embed.description:
-            parts.append(embed.description)
-        if embed.author and embed.author.name:
-            parts.append(embed.author.name)
-        if embed.footer and embed.footer.text:
-            parts.append(embed.footer.text)
+        for attr in (embed.title, embed.description):
+            if attr:
+                parts.append(str(attr))
         for field in embed.fields:
-            if field.name:
-                parts.append(field.name)
-            if field.value:
-                parts.append(field.value)
+            if field.name:  parts.append(str(field.name))
+            if field.value: parts.append(str(field.value))
+        if embed.footer and embed.footer.text:
+            parts.append(str(embed.footer.text))
+        if embed.author and embed.author.name:
+            parts.append(str(embed.author.name))
     return "\n".join(parts)
 
 
-def _extract_target_user_id(message, content_override=None):
-    combined = _combined_content(message, content_override)
-    clean = _strip_markdown(combined)
-    match = REQUEST_PATTERN.search(clean)
-    if match:
-        return int(match.group(1))
-    match = REQUEST_PATTERN_NAME.search(clean)
-    if match:
-        return match.group(1)
+def passes_keyword_filter(content: str, keywords: list[str]) -> bool:
+    if not keywords:
+        return True
+    lowered = content.lower()
+    return any(kw in lowered for kw in keywords)
+
+
+# ── resolve user ───────────────────────────────────────────────────────────
+
+async def resolve_user(
+    client: discord.Client,
+    message: discord.Message,
+    user_id: int,
+) -> discord.User | discord.Member | None:
+    for mention in message.mentions:
+        if mention.id == user_id:
+            return mention
+
+    if message.guild:
+        try:
+            return await message.guild.fetch_member(user_id)
+        except discord.HTTPException:
+            pass
+
+    try:
+        logger.debug("[USER] Fetching user %s via API", user_id)
+        return await client.fetch_user(user_id)
+    except discord.NotFound:
+        logger.warning("[USER] User %s not found", user_id)
+    except discord.HTTPException as exc:
+        logger.error("[USER] HTTP error fetching user %s: %s", user_id, exc)
+
     return None
 
 
-def _name_variants(name: str):
-    """Generate lookup candidates for a username that may have trailing _ etc."""
-    name = (name or "").strip()
-    if not name:
-        return []
-    variants = [name]
-    # without trailing underscores (Discord display sometimes adds them)
-    stripped = name.rstrip("_")
-    if stripped and stripped not in variants:
-        variants.append(stripped)
-    # without leading @
-    if name.startswith("@"):
-        variants.append(name[1:])
-    return variants
+# ── paid editor request handler ────────────────────────────────────────────
 
-
-def _find_user_by_name(client, name):
-    variants = _name_variants(name)
-    if not variants:
-        return None
-    # exact match first across all cached members
-    for guild in client.guilds:
-        for member in guild.members:
-            for attr in ("name", "display_name", "global_name"):
-                value = getattr(member, attr, None)
-                if value is None:
-                    continue
-                if value in variants or value.rstrip("_") in variants:
-                    return member
-    # case-insensitive fallback
-    lower_variants = {v.lower() for v in variants}
-    for guild in client.guilds:
-        for member in guild.members:
-            for attr in ("name", "display_name", "global_name"):
-                value = getattr(member, attr, None)
-                if value is None:
-                    continue
-                if value.lower() in lower_variants or value.lower().rstrip("_") in lower_variants:
-                    return member
-    return None
-
-
-async def handle_message(
-    message,
-    settings,
-    storage,
-    dm_sender,
-    client,
-    content_override=None,
-):
+async def handle_paid_editor_request(
+    message: discord.Message,
+    settings: Settings,
+    client: discord.Client,
+) -> None:
+    if settings.paid_request_channel_id is None:
+        return
     if message.channel.id != settings.paid_request_channel_id:
         return
-    if not _author_matches(message, settings.paid_request_trigger_author):
-        log.info(
-            "[PAID] author mismatch — got name=%r display=%r global=%r "
-            "want=%r message_id=%s",
-            getattr(message.author, "name", None),
-            getattr(message.author, "display_name", None),
-            getattr(message.author, "global_name", None),
-            settings.paid_request_trigger_author,
-            message.id,
-        )
+
+    # ── author match — checks name, display_name, and global_name ─────────
+    # Bots may expose their name differently from regular users so we check
+    # all three fields. Any one matching is enough to proceed.
+    # global_name can be None on bot accounts — guard every field.
+    trigger = settings.paid_request_trigger_author.lower()
+    author  = message.author
+    name_candidates: set[str] = set()
+    for attr in ("name", "display_name", "global_name"):
+        val = getattr(author, attr, None)
+        if isinstance(val, str) and val:
+            name_candidates.add(val.lower())
+    if trigger not in name_candidates:
         return
 
-    target = _extract_target_user_id(message, content_override)
-    if target is None:
-        log.info(
-            "[PAID] author matched but request pattern missing "
-            "message_id=%s raw_content=%r embeds=%d override=%r",
-            message.id,
-            message.content,
-            len(message.embeds),
-            content_override,
-        )
+    # ── duplicate guard ────────────────────────────────────────────────────
+    if storage.is_message_processed(message.id, kind="paid_request"):
+        logger.debug("[PAID] Msg %s already processed — skipping", message.id)
+        return
+    storage.mark_message_processed(message.id, kind="paid_request")
+
+    logger.info(
+        "[PAID] Trigger from %s in channel %s",
+        message.author, message.channel.id,
+    )
+
+    content    = await resolve_message_content(message)
+    embed_text = extract_embed_text(message)
+    search_text = strip_markdown_emphasis(f"{content}\n{embed_text}")
+
+    match = REQUEST_PATTERN.search(search_text)
+    if not match:
+        logger.warning("[PAID] Msg %s — no 'request by: <@id>' pattern found", message.id)
         return
 
-    if isinstance(target, int):
-        user = client.get_user(target)
+    user_id = int(match.group(1))
+    logger.info("[PAID] Requester found → user_id: %s", user_id)
+
+    if dm_sender.is_on_cooldown(user_id, settings.dm_cooldown_seconds):
+        logger.info("[PAID] User %s on cooldown — DM skipped", user_id)
+        return
+
+    # ── duplicate DM guard ─────────────────────────────────────────────────
+    if not storage.claim_dm_slot(user_id):
+        logger.info("[PAID] User %s — duplicate blocked (already claimed this session)", user_id)
+        return
+
+    try:
+        user = await resolve_user(client, message, user_id)
         if user is None:
-            try:
-                user = await client.fetch_user(target)
-            except Exception as exc:
-                log.error(
-                    "[PAID] failed to resolve target user_id=%s exc=%s",
-                    target,
-                    exc,
-                )
-                return
-    else:
-        user = _find_user_by_name(client, target)
-        if user is None:
-            # last resort: try the global user cache / fetch by name is not possible,
-            # so try a broader search and log what we tried
-            log.info(
-                "[PAID] could not resolve target name=%r (variants=%s) via guilds — "
-                "user is probably not sharing a server with the selfbot account",
-                target,
-                _name_variants(target),
-            )
+            logger.warning("[PAID] Could not resolve user %s — aborting", user_id)
             return
 
-    if not storage.mark_processed(message.id):
-        log.debug("[PAID] duplicate message_id=%s", message.id)
+        logger.info("  [PAID] → sending DM to %s (id: %s)", user.name, user.id)
+
+        dm_text = dm_sender.pick_message(
+            settings.paid_request_dm_messages,
+            settings.paid_request_dm_rotation,
+        )
+
+        sent = await dm_sender.send_auto_dm_sequence(
+            user,
+            dm_text,
+            settings.dm_delay_min_seconds,
+            settings.dm_delay_max_seconds,
+            settings.paid_request_part_delay_min_seconds,
+            settings.paid_request_part_delay_max_seconds,
+        )
+
+        if sent:
+            dm_sender.record_dm(user_id)
+            logger.info("  [PAID] ✓ DM complete → %s (id: %s)", user.name, user.id)
+        else:
+            logger.warning("  [PAID] ✗ DM incomplete → %s (id: %s)", user.name, user.id)
+
+    except discord.HTTPException as exc:
+        logger.error("[PAID] HTTP error for user %s: %s", user_id, exc)
+    except Exception as exc:
+        logger.error("[PAID] Unexpected error for user %s: %s", user_id, exc)
+
+
+# ── main message handler ───────────────────────────────────────────────────
+
+async def handle_incoming_message(
+    message: discord.Message,
+    settings: Settings,
+    self_user_id: int,
+    client: discord.Client,
+) -> None:
+    # ── paid request runs FIRST — before any bot/channel filters ──────────
+    # This means bot messages in the paid channel are NOT ignored here.
+    # The bot filter below only applies to the auto-DM monitored channels.
+    await handle_paid_editor_request(message, settings, client)
+
+    # ── auto-DM section — apply all filters ───────────────────────────────
+    if message.channel.id not in settings.monitored_channel_ids:
+        return
+    if settings.ignore_bot_messages and message.author.bot:
+        logger.debug(
+            "[DM] Ignoring bot message from %s (id: %s) in monitored channel",
+            message.author, message.author.id,
+        )
+        return
+    if message.author.id == self_user_id:
         return
 
-    log.info(
-        "[PAID] ┌─ request detected\n"
-        "[PAID] │ timestamp=%s\n"
-        "[PAID] │ trigger_author=%s\n"
-        "[PAID] │ target_user=%s (%s)\n"
-        "[PAID] │ channel_id=%s message_id=%s",
-        time.strftime("%Y-%m-%d %H:%M:%S"),
-        message.author.name,
-        user.name,
-        user.id,
-        message.channel.id,
-        message.id,
-    )
-
-    if not storage.check_cooldown(user.id, settings.dm_cooldown_seconds):
-        log.info("[PAID] └─ skipped target_user=%s reason=cooldown", user.name)
+    # ── duplicate guard ────────────────────────────────────────────────────
+    if storage.is_message_processed(message.id, kind="auto_dm"):
+        logger.debug("[DM] Msg %s already processed — skipping", message.id)
         return
+    storage.mark_message_processed(message.id, kind="auto_dm")
 
-    session_key = f"user-{user.id}"
-    if not storage.claim_dm_slot(user.id, session_key):
-        log.info(
-            "[PAID] └─ skipped target_user=%s reason=duplicate_slot", user.name
+    content = await resolve_message_content(message)
+
+    if not passes_keyword_filter(content, settings.keyword_filter):
+        logger.debug(
+            "[DM] Msg %s from %s — keyword filter rejected",
+            message.id, message.author,
         )
         return
 
-    ok = await dm_sender.send_dm_sequence(
-        user, message.author.name, session_key
+    # ── log the incoming message ───────────────────────────────────────────
+    ts      = message.created_at.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+    channel = getattr(message.channel, "name", str(message.channel.id))
+    guild   = message.guild.name if message.guild else "DM"
+
+    att_lines = ""
+    for a in message.attachments:
+        att_lines += f"\n  file      {a.filename}  →  {a.url}"
+
+    logger.info(
+        "\n"
+        "  ┌─ NEW MESSAGE ───────────────────────────────\n"
+        "  │  time      %s  •  #%s @ %s\n"
+        "  │  author    %s  (id: %s)\n"
+        "  │  content   %s%s\n"
+        "  └────────────────────────────────────────────",
+        ts, channel, guild,
+        message.author, message.author.id,
+        content or "<empty>", att_lines,
     )
-    if not ok:
-        log.info("[PAID] └─ DM not delivered target_user=%s", user.name)
+
+    if not settings.auto_dm_enabled:
+        logger.debug("[DM] Auto-DM disabled — skipping")
+        return
+
+    author = message.author
+
+    if dm_sender.is_on_cooldown(author.id, settings.dm_cooldown_seconds):
+        logger.info("  skipping %s (id: %s) — on cooldown", author, author.id)
+        return
+
+    # ── duplicate DM guard ─────────────────────────────────────────────────
+    # Atomically claim the slot — if two messages from different channels
+    # arrive simultaneously for the same user, only one coroutine wins here.
+    if not storage.claim_dm_slot(author.id):
+        logger.info("  skipping %s (id: %s) — duplicate blocked", author, author.id)
+        return
+
+    dm_text = dm_sender.pick_message(settings.auto_dm_messages, settings.auto_dm_rotation)
+
+    logger.info("  → sending DM to %s (id: %s)", author, author.id)
+
+    sent = await dm_sender.send_auto_dm_sequence(
+        author,
+        dm_text,
+        settings.dm_delay_min_seconds,
+        settings.dm_delay_max_seconds,
+        settings.dm_part_delay_min_seconds,
+        settings.dm_part_delay_max_seconds,
+    )
+
+    if sent:
+        dm_sender.record_dm(author.id)
+        logger.info("  ✓ DM complete → %s (id: %s)", author, author.id)
+    else:
+        logger.warning("  ✗ DM incomplete → %s (id: %s)", author, author.id)
