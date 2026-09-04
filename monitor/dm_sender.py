@@ -1,255 +1,282 @@
-from __future__ import annotations
-
-# *dm_sender.py — DM delivery engine with queue-based captcha pause/resume*
-
+# [context: discord-selfbot-monitor, os: linux, arch: x86_64]
 import asyncio
-import itertools
 import logging
 import random
+import re
+import time
 
 import discord
+from tg.state import POST_RESUME_DELAY, Waiter
 
-from monitor import storage
-from tg import telegram_bot
-from tg.state import captcha_queue, Waiter
+log = logging.getLogger("dm_sender")
 
-logger = logging.getLogger(__name__)
-
-_rotation_cycle:   itertools.cycle | None = None
-_rotation_pool_id: int | None = None
-
-
-# ── public helpers ────────────────────────────────────────────────────────
-
-def is_on_cooldown(user_id: int, cooldown_seconds: int) -> bool:
-    return storage.is_user_on_cooldown(user_id, cooldown_seconds)
-
-
-def record_dm(user_id: int) -> None:
-    storage.record_user_dm(user_id)
-
-
-def pick_message(messages: list[str], mode: str = "random") -> str:
-    global _rotation_cycle, _rotation_pool_id
-
-    if not messages:
-        raise ValueError("Message pool is empty")
-    if len(messages) == 1:
-        return messages[0]
-    if mode == "random":
-        return random.choice(messages)
-
-    pool_id = id(messages)
-    if _rotation_cycle is None or _rotation_pool_id != pool_id:
-        _rotation_cycle   = itertools.cycle(messages)
-        _rotation_pool_id = pool_id
-    return next(_rotation_cycle)
+# Generic "include / end with this word" instructions in request embeds
+_INCLUDE_WORD_RE = re.compile(
+    r"(?:also\s+)?include\s+(?:the\s+)?word\s+[\"\']?([A-Za-z0-9_\-]+)[\"\']?",
+    re.IGNORECASE,
+)
+_END_WITH_WORD_RE = re.compile(
+    r"end\s+(?:your\s+)?message\s+with\s+(?:the\s+)?word\s+[\"\']?([A-Za-z0-9_\-]+)[\"\']?",
+    re.IGNORECASE,
+)
+# fallback: "end your message with X" / "end with X in uppercase"
+_END_WITH_LOOSE_RE = re.compile(
+    r"end\s+(?:your\s+)?(?:message\s+)?with\s+[\"\']?([A-Za-z0-9_\-]+)[\"\']?"
+    r"(?:\s+in\s+uppercase)?",
+    re.IGNORECASE,
+)
 
 
-# ── captcha fingerprinting ────────────────────────────────────────────────
+class DMSender:
+    def __init__(self, settings, storage, captcha_queue, notify_captcha_cb=None):
+        self.settings = settings
+        self.storage = storage
+        self.captcha_queue = captcha_queue
+        self.notify_captcha_cb = notify_captcha_cb
+        self._seq_index = 0
+        # persist sequential cursor across restarts via storage if possible
+        self._load_seq_index()
 
-def _is_captcha_error(exc: discord.HTTPException) -> bool:
-    err_text = str(exc).lower()
-    return (
-        "captcha" in err_text
-        or getattr(exc, "code", None) == -1
-        or (exc.status == 400 and "captcha" in err_text)
-    )
-
-
-# ── single DM (unchanged public API) ─────────────────────────────────────
-
-async def send_auto_dm(
-    author: discord.User | discord.Member,
-    message: str,
-    delay_min: float,
-    delay_max: float,
-) -> bool:
-    delay = random.uniform(delay_min, delay_max)
-    if delay > 0:
-        logger.info("[DM] Waiting %.1fs before single DM → %s (id: %s)", delay, author, author.id)
-        await asyncio.sleep(delay)
-
-    try:
-        await author.send(message)
-        logger.info("[DM] ✓ Single DM sent → %s (id: %s)", author, author.id)
-        return True
-    except discord.Forbidden:
-        logger.warning("[DM] ✗ Forbidden → %s (id: %s) — DMs closed or blocked", author, author.id)
-        return False
-    except discord.HTTPException as exc:
-        logger.error("[DM] ✗ HTTP error → %s (id: %s): %s", author, author.id, exc)
-        return False
-
-
-# ── sequence sender ───────────────────────────────────────────────────────
-
-async def send_auto_dm_sequence(
-    author: discord.User | discord.Member,
-    message: str,
-    delay_min: float,
-    delay_max: float,
-    part_delay_min: float,
-    part_delay_max: float,
-) -> bool:
-    parts = [line.strip() for line in message.split("\n") if line.strip()]
-    if not parts:
-        logger.warning("[DM] Empty message for %s (id: %s) — skipping", author, author.id)
-        return False
-
-    total    = len(parts)
-    username = str(author)
-
-    # persist before touching Discord
-    queue_id = storage.queue_create(author.id, username, parts)
-    logger.info(
-        "[DM] Queue row %d created → %s (id: %s) | %d part(s)",
-        queue_id, username, author.id, total,
-    )
-
-    # initial delay
-    delay = random.uniform(delay_min, delay_max)
-    if delay > 0:
-        logger.info("[DM] Initial delay %.1fs → %s (id: %s)", delay, author, author.id)
-        await asyncio.sleep(delay)
-
-    index = 0
-    while index < total:
-        part        = parts[index]
-        human_index = index + 1
-
-        sent = await _send_part(
-            author          = author,
-            part            = part,
-            part_human_index= human_index,
-            total           = total,
-            queue_id        = queue_id,
-            index           = index,
-            username        = username,
-        )
-
-        if sent is False:
-            storage.queue_update_progress(queue_id, index, "paused")
-            logger.warning(
-                "[DM] Sequence aborted at part %d/%d → %s (id: %s)",
-                human_index, total, username, author.id,
-            )
-            return False
-
-        index += 1
-        storage.queue_update_progress(queue_id, index, "pending")
-
-        if index < total:
-            gap = random.uniform(part_delay_min, part_delay_max)
-            if gap > 0:
-                logger.info(
-                    "[DM] Part delay %.1fs before part %d/%d → %s (id: %s)",
-                    gap, index + 1, total, author, author.id,
-                )
-                await asyncio.sleep(gap)
-
-    storage.queue_update_progress(queue_id, total, "done")
-    logger.info(
-        "[DM] ✓ All %d part(s) delivered → %s (id: %s)",
-        total, author, author.id,
-    )
-    return True
-
-
-# ── one part with captcha escalation ─────────────────────────────────────
-
-async def _send_part(
-    author:           discord.User | discord.Member,
-    part:             str,
-    part_human_index: int,
-    total:            int,
-    queue_id:         int,
-    index:            int,
-    username:         str,
-) -> bool:
-    for attempt in range(2):    # 0 = first try, 1 = post-resume retry
+    def _load_seq_index(self):
         try:
-            await author.send(part)
-            logger.info(
-                "[DM] ✓ Part %d/%d sent → %s (id: %s)%s",
-                part_human_index, total, author, author.id,
-                " [post-resume]" if attempt == 1 else "",
-            )
-            return True
+            # optional table; ignore if not present
+            with self.storage._lock:
+                row = self.storage._conn.execute(
+                    "SELECT value FROM meta WHERE key = 'dm_seq_index'"
+                ).fetchone()
+            if row is not None:
+                self._seq_index = int(row[0])
+        except Exception:
+            self._seq_index = 0
 
-        except discord.Forbidden:
-            logger.warning(
-                "[DM] ✗ Part %d/%d forbidden → %s (id: %s) — DMs closed or blocked",
-                part_human_index, total, author, author.id,
+    def _save_seq_index(self):
+        try:
+            with self.storage._lock:
+                self.storage._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS meta ("
+                    "key TEXT PRIMARY KEY, value TEXT)"
+                )
+                self.storage._conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("dm_seq_index", str(self._seq_index)),
+                )
+                self.storage._conn.commit()
+        except Exception as exc:
+            log.debug("[DM] could not persist seq index: %s", exc)
+
+    def pick_message(self):
+        messages = list(self.settings.dm_messages or [])
+        if not messages:
+            return None, -1
+
+        rotation = (self.settings.dm_rotation or "random").strip().lower()
+        n = len(messages)
+
+        if rotation == "sequential":
+            idx = self._seq_index % n
+            self._seq_index = (self._seq_index + 1) % n
+            self._save_seq_index()
+            log.info(
+                "[DM] sequential pick index=%d/%d next_cursor=%d",
+                idx,
+                n,
+                self._seq_index,
+            )
+            return messages[idx], idx
+
+        # random (default) — uniform across the whole pool every time
+        idx = random.randrange(n)
+        log.info("[DM] random pick index=%d/%d pool_size=%d", idx, n, n)
+        return messages[idx], idx
+
+    def _split_parts(self, raw):
+        text = raw.replace("\\n", "\n").replace("\r\n", "\n")
+        parts = [p.strip() for p in text.split("\n")]
+        return [p for p in parts if p]
+
+    def _extract_challenge_words(self, trigger_text: str) -> list:
+        """
+        Parse the request text for instructions like:
+          - Also include the word "Bloop"
+          - end your message with the word "MEGALODON" in uppercase
+          - include the word best
+        Returns ordered unique words to append (already cased as requested).
+        """
+        if not trigger_text:
+            return []
+
+        found = []
+        seen = set()
+
+        def add(word: str, force_upper: bool = False):
+            if not word:
+                return
+            w = word.upper() if force_upper else word
+            key = w.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            found.append(w)
+
+        # "include the word X"
+        for m in _INCLUDE_WORD_RE.finditer(trigger_text):
+            add(m.group(1))
+
+        # "end your message with the word X" / "… in uppercase"
+        for m in _END_WITH_WORD_RE.finditer(trigger_text):
+            word = m.group(1)
+            span = trigger_text[m.start(): m.end() + 20].lower()
+            force_upper = "uppercase" in span or "upper case" in span
+            # if the quoted/captured word is already all-caps in the source, keep it
+            if word.isupper():
+                force_upper = True
+            add(word, force_upper=force_upper)
+
+        # loose "end with X" if nothing found yet
+        if not found:
+            for m in _END_WITH_LOOSE_RE.finditer(trigger_text):
+                word = m.group(1)
+                # skip common filler words that aren't challenges
+                if word.lower() in {"the", "a", "an", "your", "message", "word"}:
+                    continue
+                span = trigger_text[m.start(): m.end() + 20].lower()
+                force_upper = "uppercase" in span or word.isupper()
+                add(word, force_upper=force_upper)
+
+        return found
+
+    def _apply_challenge_suffix(self, parts, challenge_words: list):
+        """
+        Send required challenge words as an EXTRA final DM (new message),
+        not glued onto the previous part.
+        """
+        if not parts or not challenge_words:
+            return parts
+
+        # skip words already present in any existing part
+        existing = " ".join(parts).lower()
+        to_add = [w for w in challenge_words if w.lower() not in existing]
+        if not to_add:
+            return parts
+
+        # each required word (or the whole set) as its own trailing message
+        # one extra part containing all required words keeps part count sane
+        extra = " ".join(to_add)
+        parts = list(parts) + [extra]
+        log.info("[DM] will send challenge words as extra final message: %r", extra)
+        return parts
+
+    async def send_dm_sequence(
+        self, user, trigger_author, session_key, trigger_text=""
+    ):
+        message, pool_index = self.pick_message()
+        if message is None:
+            log.warning("[DM] no DM messages configured")
+            return False
+
+        parts = self._split_parts(message)
+        if not parts:
+            log.warning("[DM] message #%d contained no parts", pool_index)
+            return False
+
+        challenge_words = self._extract_challenge_words(trigger_text or "")
+        if challenge_words:
+            log.info("[DM] challenge words detected: %s", challenge_words)
+            parts = self._apply_challenge_suffix(parts, challenge_words)
+
+        initial_delay = random.uniform(
+            self.settings.dm_delay_min_seconds,
+            self.settings.dm_delay_max_seconds,
+        )
+        log.info(
+            "[DM] ┌─ DM sequence start\n"
+            "[DM] │ timestamp=%s\n"
+            "[DM] │ author=%s\n"
+            "[DM] │ user=%s (%s)\n"
+            "[DM] │ parts=%d pool_index=%d rotation=%s",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            trigger_author,
+            user.name,
+            user.id,
+            len(parts),
+            pool_index,
+            self.settings.dm_rotation,
+        )
+        await asyncio.sleep(initial_delay)
+
+        try:
+            for i, part in enumerate(parts):
+                ok = await self._send_part(user, part, i, trigger_author)
+                if not ok:
+                    self.storage.complete_dm(user.id, session_key, False)
+                    log.info("[DM] └─ DM sequence aborted user=%s", user.name)
+                    return False
+                if i < len(parts) - 1:
+                    delay = random.uniform(
+                        self.settings.part_delay_min_seconds,
+                        self.settings.part_delay_max_seconds,
+                    )
+                    await asyncio.sleep(delay)
+        except Exception as exc:
+            self.storage.complete_dm(user.id, session_key, False)
+            log.error(
+                "[DM] └─ DM sequence failed user=%s exc=%s", user.name, exc
             )
             return False
 
-        except discord.HTTPException as exc:
-            error_str = str(exc)
+        self.storage.complete_dm(user.id, session_key, True)
+        self.storage.record_dm(user.id)
+        self.storage.log_sent(user.id, user.name, trigger_author, pool_index)
+        log.info(
+            "[DM] └─ DM sequence complete user=%s pool_index=%d",
+            user.name,
+            pool_index,
+        )
+        return True
 
-            if not _is_captcha_error(exc):
-                logger.error(
-                    "[DM] ✗ Part %d/%d HTTP error → %s (id: %s): %s",
-                    part_human_index, total, author, author.id, exc,
+    async def _send_part(self, user, content, part_index, trigger_author):
+        while True:
+            try:
+                await user.send(content)
+                log.info(
+                    "[DM] part %d sent user=%s content_len=%d pool_preview=%r",
+                    part_index + 1,
+                    user.name,
+                    len(content),
+                    content[:40],
+                )
+                return True
+            except discord.HTTPException as exc:
+                text = str(exc).lower()
+                if "captcha" in text or getattr(exc, "code", None) == -1:
+                    waiter = Waiter(
+                        user.id, user.name, part_index + 1, trigger_author
+                    )
+                    self.captcha_queue.push(waiter)
+                    log.warning(
+                        "[DM] captcha hit user=%s part=%d queue_size=%d",
+                        user.name,
+                        part_index + 1,
+                        len(self.captcha_queue),
+                    )
+                    if self.notify_captcha_cb is not None:
+                        try:
+                            await self.notify_captcha_cb(waiter)
+                        except Exception as exc_notify:
+                            log.error(
+                                "[DM] telegram captcha notify failed: %s",
+                                exc_notify,
+                            )
+                    await waiter.wait()
+                    if waiter.skipped:
+                        return False
+                    await asyncio.sleep(POST_RESUME_DELAY)
+                    continue
+                log.error(
+                    "[DM] HTTPException user=%s part=%d code=%s text=%s",
+                    user.name,
+                    part_index + 1,
+                    getattr(exc, "code", None),
+                    exc,
                 )
                 return False
-
-            # ── captcha ────────────────────────────────────────────────────
-            logger.warning(
-                "[DM] ⚠ Captcha on part %d/%d → %s (id: %s): %s",
-                part_human_index, total, author, author.id, exc,
-            )
-
-            if attempt == 0:
-                waiter = Waiter(
-                    user_id    = author.id,
-                    username   = username,
-                    part_index = index,
-                    total_parts= total,
-                    last_error = error_str,
-                )
-                captcha_queue.add(waiter)
-                storage.queue_update_progress(queue_id, index, "paused")
-
-                logger.warning(
-                    "[DM] Captcha queue depth: %d — awaiting /resume for %s (id: %s)",
-                    captcha_queue.pending, username, author.id,
-                )
-
-                await telegram_bot.notify_captcha(
-                    username   = username,
-                    user_id    = author.id,
-                    part       = part_human_index,
-                    total      = total,
-                    error      = error_str,
-                    queue_size = captcha_queue.pending,
-                )
-
-                await waiter.wait()
-
-                # ── skip check ─────────────────────────────────────────────
-                # waiter.abort() fires the event with skipped=True.
-                # If that's what woke us, abort the sequence — do NOT retry.
-                if waiter.skipped:
-                    logger.info(
-                        "[DM] Sequence skipped via /skip → %s (id: %s) — aborting part %d/%d",
-                        username, author.id, part_human_index, total,
-                    )
-                    storage.queue_update_progress(queue_id, index, "paused")
-                    return False
-
-                logger.info(
-                    "[DM] Resumed → retrying part %d/%d for %s (id: %s)",
-                    part_human_index, total, username, author.id,
-                )
-                storage.queue_update_progress(queue_id, index, "pending")
-                continue
-
-            # attempt 1 still captcha — give up
-            logger.error(
-                "[DM] ✗ Captcha persists after resume → %s (id: %s) — aborting part %d/%d",
-                author, author.id, part_human_index, total,
-            )
-            return False
-
-    return False
