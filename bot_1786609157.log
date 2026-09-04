@@ -1,0 +1,89 @@
+2026-08-13 13:49:17 | INFO | Telegram log forwarding active (level: INFO)
+2026-08-13 13:49:17 | WARNING | PyNaCl is not installed, voice will NOT be supported.
+2026-08-13 13:49:17 | INFO | WATCHDOG_MODE=true — Telegram poll loop disabled (watchdog owns it)
+2026-08-13 13:49:17 | INFO | Logging in using static token.
+2026-08-13 13:49:17 | INFO | Signal poller started — watching D:\Discord\Bot - Copy\.watchdog_signals
+2026-08-13 13:49:18 | INFO | Found user agent Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36, build number 591604.
+2026-08-13 13:49:22 | INFO | Connected to Gateway (Session ID: e607623e64d2a9b6009af29725188a19).
+2026-08-13 13:49:22 | WARNING | Member list scraping failed for 1457311847542685799 (Failed to automatically choose channels; please specify them manually).
+2026-08-13 13:49:23 | INFO | 
+  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+  \u2551              BOT ONLINE                      \u2551
+  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
+  account    nick.editz_  (id: 1412506213320757460)
+  channels   2 monitored
+               • 859164604831498280
+               • 1535705622107132005
+  auto-dm    ON  •  6 variant(s)  •  random  •  cooldown 100s  •  delay 5–15s
+  paid req   channel 1433194028609831015  •  author: hr08jaat
+  keywords   video, middleman - no, middleman=no, editor, editors
+  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+2026-08-13 14:06:03 | INFO | 
+  \u250c\u2500 NEW MESSAGE \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  \u2502  time      08:36:04 UTC  •  #\u3022looking-for-editors @ HARSH KA SERVER
+  \u2502  author    .1tami.#0  (id: 1005880916708696176)
+  \u2502  content   Need - shortform video editor
+Work - shortform edits videos 
+Budget -800- 1000 inr
+Middleman- no
+Term- long term
+Payment method-upi, paypal
+  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+2026-08-13 14:06:03 | INFO |   \u2192 sending DM to .1tami.#0 (id: 1005880916708696176)
+2026-08-13 14:06:03 | INFO | [DM] Queue row 4 created \u2192 .1tami.#0 (id: 1005880916708696176) | 3 part(s)
+2026-08-13 14:06:03 | INFO | [DM] Initial delay 5.6s \u2192 .1tami.#0 (id: 1005880916708696176)
+2026-08-13 14:06:10 | WARNING | [DM] \u2717 Part 1/3 forbidden \u2192 .1tami.#0 (id: 1005880916708696176) — DMs closed or blocked
+2026-08-13 14:06:10 | WARNING | [DM] Sequence aborted at part 1/3 \u2192 .1tami.#0 (id: 1005880916708696176)
+2026-08-13 14:06:10 | WARNING |   \u2717 DM incomplete \u2192 .1tami.#0 (id: 1005880916708696176)
+2026-08-13 14:20:20 | INFO | Signal received: queue_status
+2026-08-13 14:21:04 | INFO | Signal received: queue_status
+2026-08-13 14:25:07 | INFO | Signal received: logs_status
+2026-08-13 14:38:44 | INFO | 
+  \u250c\u2500 NEW MESSAGE \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  \u2502  time      09:08:45 UTC  •  #\u3022looking-for-editors @ HARSH KA SERVER
+  \u2502  author    vipinedits124#0  (id: 1413365197703479497)
+  \u2502  content   Hey i need a urgent editor of a real state video 
+payment will be good and you get bonus also if your edit is really good 
+i need the video asap you can deliver .
+dm me if you have best quality in real state types of edits
+  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+2026-08-13 14:38:44 | INFO |   \u2192 sending DM to vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:38:44 | INFO | [DM] Queue row 5 created \u2192 vipinedits124#0 (id: 1413365197703479497) | 2 part(s)
+2026-08-13 14:38:44 | INFO | [DM] Initial delay 14.5s \u2192 vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:39:00 | WARNING | [DM] \u26a0 Captcha on part 1/2 \u2192 vipinedits124#0 (id: 1413365197703479497): 400 Bad Request (error code: -1): Captcha required
+2026-08-13 14:39:00 | WARNING | [DM] Captcha queue depth: 1 — awaiting /resume for vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:41:00 | INFO | Signal received: queue_status
+2026-08-13 14:41:06 | INFO | Signal received: resume
+2026-08-13 14:41:37 | INFO | Resumed via signal \u2192 vipinedits124#0 (id: 1413365197703479497) part 1/2
+2026-08-13 14:41:37 | INFO | [DM] Resumed \u2192 retrying part 1/2 for vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:41:39 | INFO | [DM] \u2713 Part 1/2 sent \u2192 vipinedits124#0 (id: 1413365197703479497) [post-resume]
+2026-08-13 14:41:39 | INFO | [DM] Part delay 7.6s before part 2/2 \u2192 vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:41:47 | INFO | [DM] \u2713 Part 2/2 sent \u2192 vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:41:47 | INFO | [DM] \u2713 All 2 part(s) delivered \u2192 vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:41:47 | INFO |   \u2713 DM complete \u2192 vipinedits124#0 (id: 1413365197703479497)
+2026-08-13 14:42:27 | INFO | Gateway session has been invalidated.
+Traceback (most recent call last):
+  File "D:\Discord\Bot - Copy\main.py", line 264, in <module>
+    main()
+    ~~~~^^
+  File "D:\Discord\Bot - Copy\main.py", line 258, in main
+    asyncio.run(_run(settings))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\Discord\Bot - Copy\main.py", line 213, in _run
+    await client.start(settings.token)
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\site-packages\discord\client.py", line 858, in start
+    await self.connect(reconnect=reconnect)
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\site-packages\discord\client.py", line 738, in connect
+    await self.ws.poll_event()
+  File "C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\site-packages\discord\gateway.py", line 671, in poll_event
+    raise ConnectionClosed(self.socket, code=code) from None
+discord.errors.ConnectionClosed: WebSocket closed with 4004
