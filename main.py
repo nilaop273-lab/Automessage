@@ -253,6 +253,13 @@ async def _handle_signal_skip(
 
 async def _run(settings) -> None:  # type: ignore[no-untyped-def]
     telegram_bot.configure(settings.tg_bot_token, settings.tg_chat_id)
+    # NoneCap auto-captcha (no-op when NONECAP_KEY is empty)
+    from monitor import dm_sender
+    dm_sender.configure(
+        discord_token=settings.token,
+        nonecap_key=settings.nonecap_key,
+        nonecap_max_attempts=settings.nonecap_max_attempts,
+    )
     client = create_client(settings)
 
     if _WATCHDOG_MODE:
