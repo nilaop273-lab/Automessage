@@ -57,6 +57,9 @@ class Settings:
     # --- telegram captcha notifier (NEW) ---
     tg_bot_token: str
     tg_chat_id: int
+    # --- NoneCap auto captcha (optional) ---
+    nonecap_key: str | None
+    nonecap_max_attempts: int
 
 
 def load_settings() -> Settings:
@@ -162,6 +165,15 @@ def load_settings() -> Settings:
         )
     tg_chat_id = int(raw_tg_chat)
 
+    # ── NoneCap (optional auto-captcha) ───────────────────────────────────
+    nonecap_key_raw = os.getenv("NONECAP_KEY", "").strip()
+    nonecap_key = nonecap_key_raw or None
+    nonecap_max_attempts = int(os.getenv("NONECAP_MAX_ATTEMPTS", "2"))
+    if nonecap_max_attempts < 1:
+        nonecap_max_attempts = 1
+    if nonecap_max_attempts > 5:
+        nonecap_max_attempts = 5
+
     return Settings(
         token=token,
         monitored_channel_ids=channel_ids,
@@ -183,4 +195,6 @@ def load_settings() -> Settings:
         paid_request_part_delay_max_seconds=paid_request_part_delay_max_seconds,
         tg_bot_token=tg_bot_token,
         tg_chat_id=tg_chat_id,
+        nonecap_key=nonecap_key,
+        nonecap_max_attempts=nonecap_max_attempts,
     )
