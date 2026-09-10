@@ -10,6 +10,11 @@ import random
 import discord
 
 from monitor import storage
+from monitor.captcha_solver import (
+    parse_captcha_from_exception,
+    send_dm_with_captcha,
+    solve_with_nonecap,
+)
 from tg import telegram_bot
 from tg.state import captcha_queue, Waiter
 
@@ -17,6 +22,30 @@ logger = logging.getLogger(__name__)
 
 _rotation_cycle:   itertools.cycle | None = None
 _rotation_pool_id: int | None = None
+
+# set via configure() from main once settings are loaded
+_discord_token: str | None = None
+_nonecap_key: str | None = None
+_nonecap_max_attempts: int = 2
+
+
+def configure(
+    discord_token: str,
+    nonecap_key: str | None = None,
+    nonecap_max_attempts: int = 2,
+) -> None:
+    """Called once at startup so captcha auto-solve can use the user token + API key."""
+    global _discord_token, _nonecap_key, _nonecap_max_attempts
+    _discord_token = discord_token
+    _nonecap_key = nonecap_key or None
+    _nonecap_max_attempts = max(1, min(int(nonecap_max_attempts), 5))
+    if _nonecap_key:
+        logger.info(
+            "[DM] NoneCap auto-captcha enabled (max_attempts=%d)",
+            _nonecap_max_attempts,
+        )
+    else:
+        logger.info("[DM] NoneCap auto-captcha disabled — telegram /resume only")
 
 
 # ── public helpers ────────────────────────────────────────────────────────
@@ -156,6 +185,81 @@ async def send_auto_dm_sequence(
     return True
 
 
+# ── auto captcha via NoneCap ──────────────────────────────────────────────
+
+async def _try_nonecap_solve(
+    author: discord.User | discord.Member,
+    part: str,
+    exc: discord.HTTPException,
+    part_human_index: int,
+    total: int,
+) -> bool:
+    """
+    Attempt up to _nonecap_max_attempts NoneCap solves + raw REST retries.
+    Returns True if the part was delivered. False → caller should fall back
+    to the Telegram /resume queue.
+    """
+    if not _nonecap_key or not _discord_token:
+        return False
+
+    challenge = parse_captcha_from_exception(exc)
+    if challenge is None:
+        logger.warning(
+            "[DM] Captcha payload unparseable for %s — skipping auto-solve. raw=%s",
+            author.id,
+            str(exc)[:300],
+        )
+        return False
+
+    for n in range(1, _nonecap_max_attempts + 1):
+        logger.info(
+            "[DM] NoneCap attempt %d/%d for part %d/%d → %s",
+            n,
+            _nonecap_max_attempts,
+            part_human_index,
+            total,
+            author,
+        )
+        solution = await solve_with_nonecap(_nonecap_key, challenge)
+        if solution is None:
+            logger.warning("[DM] NoneCap attempt %d returned no token", n)
+            continue
+
+        ok, detail = await send_dm_with_captcha(
+            _discord_token,
+            author.id,
+            part,
+            solution,
+        )
+        if ok:
+            logger.info(
+                "[DM] ✓ Part %d/%d sent via NoneCap → %s (id: %s)",
+                part_human_index,
+                total,
+                author,
+                author.id,
+            )
+            return True
+
+        logger.warning(
+            "[DM] NoneCap token rejected/failed attempt %d: %s",
+            n,
+            detail[:400],
+        )
+        # if discord returned a fresh captcha payload, refresh challenge
+        # (detail may contain json); best-effort re-parse
+        maybe = parse_captcha_from_exception(Exception(detail))
+        if maybe is not None:
+            challenge = maybe
+
+    logger.warning(
+        "[DM] NoneCap exhausted %d attempt(s) for %s — falling back to Telegram",
+        _nonecap_max_attempts,
+        author,
+    )
+    return False
+
+
 # ── one part with captcha escalation ─────────────────────────────────────
 
 async def _send_part(
@@ -167,7 +271,9 @@ async def _send_part(
     index:            int,
     username:         str,
 ) -> bool:
-    for attempt in range(2):    # 0 = first try, 1 = post-resume retry
+    # attempt 0 = first try (+ optional NoneCap)
+    # attempt 1 = after Telegram /resume
+    for attempt in range(2):
         try:
             await author.send(part)
             logger.info(
@@ -200,7 +306,16 @@ async def _send_part(
                 part_human_index, total, author, author.id, exc,
             )
 
+            # Auto-solve first (only on the initial attempt — after /resume
+            # the human already cleared the client-side captcha).
             if attempt == 0:
+                auto_ok = await _try_nonecap_solve(
+                    author, part, exc, part_human_index, total
+                )
+                if auto_ok:
+                    return True
+
+                # fall through to Telegram pause
                 waiter = Waiter(
                     user_id    = author.id,
                     username   = username,
@@ -227,9 +342,6 @@ async def _send_part(
 
                 await waiter.wait()
 
-                # ── skip check ─────────────────────────────────────────────
-                # waiter.abort() fires the event with skipped=True.
-                # If that's what woke us, abort the sequence — do NOT retry.
                 if waiter.skipped:
                     logger.info(
                         "[DM] Sequence skipped via /skip → %s (id: %s) — aborting part %d/%d",
